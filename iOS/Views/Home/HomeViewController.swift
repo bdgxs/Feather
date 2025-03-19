@@ -2026,3 +2026,608 @@ extension AppDownload: URLSessionDownloadDelegate {
         }
     }
 }
+// MARK: - TextEditorViewController
+
+protocol TextEditorDelegate: AnyObject {
+    func textEditorDidSave(_ editor: TextEditorViewController)
+}
+
+class TextEditorViewController: UIViewController {
+    
+    // MARK: - Properties
+    
+    private let fileURL: URL
+    private var text: String
+    private var isModified = false
+    weak var delegate: TextEditorDelegate?
+    
+    // MARK: - UI Components
+    
+    private let textView: UITextView = {
+        let textView = UITextView()
+        textView.font = UIFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+        textView.autocapitalizationType = .none
+        textView.autocorrectionType = .no
+        textView.spellCheckingType = .no
+        textView.translatesAutoresizingMaskIntoConstraints = false
+        return textView
+    }()
+    
+    // MARK: - Initialization
+    
+    init(fileURL: URL, text: String) {
+        self.fileURL = fileURL
+        self.text = text
+        super.init(nibName: nil, bundle: nil)
+    }
+    
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+    // MARK: - Lifecycle Methods
+    
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        setupUI()
+        configureNavigationBar()
+        
+        // Set text
+        textView.text = text
+        textView.delegate = self
+        
+        // Set title
+        title = fileURL.lastPathComponent
+    }
+    
+    // MARK: - UI Setup
+    
+    private func setupUI() {
+        view.backgroundColor = .systemBackground
+        
+        // Add text view
+        view.addSubview(textView)
+        
+        // Set constraints
+        NSLayoutConstraint.activate([
+            textView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            textView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            textView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            textView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor)
+        ])
+    }
+    
+    private func configureNavigationBar() {
+        // Add save button
+        let saveButton = UIBarButtonItem(barButtonSystemItem: .save, target: self, action: #selector(saveFile))
+        
+        // Add share button
+        let shareButton = UIBarButtonItem(barButtonSystemItem: .action, target: self, action: #selector(shareFile))
+        
+        // Add find button
+        let findButton = UIBarButtonItem(barButtonSystemItem: .search, target: self, action: #selector(findInText))
+        
+        navigationItem.rightBarButtonItems = [saveButton, shareButton, findButton]
+        
+        // Add cancel button
+        let cancelButton = UIBarButtonItem(barButtonSystemItem: .cancel, target: self, action: #selector(cancel))
+        navigationItem.leftBarButtonItem = cancelButton
+    }
+    // MARK: - Actions
+    
+    @objc private func saveFile() {
+        do {
+            try textView.text.write(to: fileURL, atomically: true, encoding: .utf8)
+            isModified = false
+            delegate?.textEditorDidSave(self)
+            dismiss(animated: true)
+        } catch {
+            showAlert(title: NSLocalizedString("Save Failed", comment: "Save failed title"), message: error.localizedDescription)
+        }
+    }
+    
+    @objc private func shareFile() {
+        let activityVC = UIActivityViewController(activityItems: [fileURL], applicationActivities: nil)
+        
+        // For iPad
+        if let popoverController = activityVC.popoverPresentationController {
+            popoverController.barButtonItem = navigationItem.rightBarButtonItems?[1]
+        }
+        
+        present(activityVC, animated: true)
+    }
+    
+    @objc private func findInText() {
+        let alertController = UIAlertController(
+            title: NSLocalizedString("Find", comment: "Find title"),
+            message: NSLocalizedString("Enter text to search for", comment: "Find message"),
+            preferredStyle: .alert
+        )
+        
+        alertController.addTextField { textField in
+            textField.placeholder = NSLocalizedString("Search text", comment: "Search placeholder")
+            textField.clearButtonMode = .whileEditing
+            textField.autocapitalizationType = .none
+        }
+        
+        let searchAction = UIAlertAction(title: NSLocalizedString("Find", comment: "Find button"), style: .default) { [weak self, weak alertController] _ in
+            guard let self = self, let searchText = alertController?.textFields?.first?.text, !searchText.isEmpty else { return }
+            
+            self.performSearch(searchText)
+        }
+        
+        let cancelAction = UIAlertAction(title: NSLocalizedString("Cancel", comment: "Cancel button"), style: .cancel)
+        
+        alertController.addAction(searchAction)
+        alertController.addAction(cancelAction)
+        
+        present(alertController, animated: true)
+    }
+    
+    private func performSearch(_ searchText: String) {
+        guard let textRange = textView.text.range(of: searchText, options: .caseInsensitive) else {
+            showAlert(title: NSLocalizedString("Not Found", comment: "Not found title"), message: NSLocalizedString("The text was not found", comment: "Not found message"))
+            return
+        }
+        
+        let nsRange = NSRange(textRange, in: textView.text)
+        textView.selectedRange = nsRange
+        textView.scrollRangeToVisible(nsRange)
+    }
+    
+    @objc private func cancel() {
+        if isModified {
+            let alertController = UIAlertController(
+                title: NSLocalizedString("Unsaved Changes", comment: "Unsaved changes title"),
+                message: NSLocalizedString("Do you want to save your changes?", comment: "Unsaved changes message"),
+                preferredStyle: .alert
+            )
+            
+            let saveAction = UIAlertAction(title: NSLocalizedString("Save", comment: "Save button"), style: .default) { [weak self] _ in
+                self?.saveFile()
+            }
+            
+            let discardAction = UIAlertAction(title: NSLocalizedString("Discard", comment: "Discard button"), style: .destructive) { [weak self] _ in
+                self?.dismiss(animated: true)
+            }
+            
+            let cancelAction = UIAlertAction(title: NSLocalizedString("Cancel", comment: "Cancel button"), style: .cancel)
+            
+            alertController.addAction(saveAction)
+            alertController.addAction(discardAction)
+            alertController.addAction(cancelAction)
+            
+            present(alertController, animated: true)
+        } else {
+            dismiss(animated: true)
+        }
+    }
+// MARK: - ImageViewerViewController
+
+class ImageViewerViewController: UIViewController {
+    
+    // MARK: - Properties
+    
+    private let imageURL: URL
+    private var image: UIImage?
+    
+    // MARK: - UI Components
+    
+    private let scrollView: UIScrollView = {
+        let scrollView = UIScrollView()
+        scrollView.minimumZoomScale = 1.0
+        scrollView.maximumZoomScale = 5.0
+        scrollView.showsHorizontalScrollIndicator = false
+        scrollView.showsVerticalScrollIndicator = false
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        return scrollView
+    }()
+    
+    private let imageView: UIImageView = {
+        let imageView = UIImageView()
+        imageView.contentMode = .scaleAspectFit
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        return imageView
+    }()
+    
+    // MARK: - Initialization
+    
+    init(imageURL: URL) {
+        self.imageURL = imageURL
+        super.init(nibName: nil, bundle: nil)
+    }
+    
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+    // MARK: - Lifecycle Methods
+    
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        setupUI()
+        configureNavigationBar()
+        loadImage()
+        
+        // Set title
+        title = imageURL.lastPathComponent
+    }
+    
+    // MARK: - UI Setup
+    
+    private func setupUI() {
+        view.backgroundColor = .systemBackground
+        
+        // Add scroll view
+        view.addSubview(scrollView)
+        
+        // Add image view to scroll view
+        scrollView.addSubview(imageView)
+        
+        // Set constraints
+        NSLayoutConstraint.activate([
+            scrollView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
+            
+            imageView.widthAnchor.constraint(equalTo: scrollView.widthAnchor),
+            imageView.heightAnchor.constraint(equalTo: scrollView.heightAnchor),
+            imageView.centerXAnchor.constraint(equalTo: scrollView.centerXAnchor),
+            imageView.centerYAnchor.constraint(equalTo: scrollView.centerYAnchor)
+        ])
+        
+        // Set up scroll view delegate
+        scrollView.delegate = self
+        
+        // Add double tap gesture for zoom
+        let doubleTapGesture = UITapGestureRecognizer(target: self, action: #selector(handleDoubleTap(_:)))
+        doubleTapGesture.numberOfTapsRequired = 2
+        scrollView.addGestureRecognizer(doubleTapGesture)
+    }
+    
+    private func configureNavigationBar() {
+        // Add share button
+        let shareButton = UIBarButtonItem(barButtonSystemItem: .action, target: self, action: #selector(shareImage))
+        
+        // Add save button
+        let saveButton = UIBarButtonItem(barButtonSystemItem: .save, target: self, action: #selector(saveToPhotos))
+        
+        navigationItem.rightBarButtonItems = [shareButton, saveButton]
+        
+        // Add done button
+        let doneButton = UIBarButtonItem(barButtonSystemItem: .done, target: self, action: #selector(dismiss(_:)))
+        navigationItem.leftBarButtonItem = doneButton
+    }
+    // MARK: - Image Loading
+    
+    private func loadImage() {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            
+            do {
+                let imageData = try Data(contentsOf: self.imageURL)
+                if let image = UIImage(data: imageData) {
+                    self.image = image
+                    
+                    DispatchQueue.main.async {
+                        self.imageView.image = image
+                        self.updateZoomScaleForSize(self.view.bounds.size)
+                    }
+                } else {
+                    self.showErrorAlert(message: NSLocalizedString("Failed to load image", comment: "Image load error"))
+                }
+            } catch {
+                self.showErrorAlert(message: error.localizedDescription)
+            }
+        }
+    }
+    
+    private func updateZoomScaleForSize(_ size: CGSize) {
+        guard let image = image, image.size.width > 0, image.size.height > 0 else { return }
+        
+        let widthScale = size.width / image.size.width
+        let heightScale = size.height / image.size.height
+        let minScale = min(widthScale, heightScale)
+        
+        scrollView.minimumZoomScale = minScale
+        scrollView.maximumZoomScale = minScale * 3.0
+        scrollView.zoomScale = minScale
+    }
+    
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        updateZoomScaleForSize(view.bounds.size)
+    }
+    
+    // MARK: - Actions
+    
+    @objc private func handleDoubleTap(_ gesture: UITapGestureRecognizer) {
+        if scrollView.zoomScale > scrollView.minimumZoomScale {
+            scrollView.setZoomScale(scrollView.minimumZoomScale, animated: true)
+        } else {
+            let point = gesture.location(in: imageView)
+            let scrollSize = scrollView.frame.size
+            
+            let width = scrollSize.width / scrollView.maximumZoomScale
+            let height = scrollSize.height / scrollView.maximumZoomScale
+            let x = point.x - (width / 2.0)
+            let y = point.y - (height / 2.0)
+            
+            let rect = CGRect(x: x, y: y, width: width, height: height)
+            scrollView.zoom(to: rect, animated: true)
+        }
+    }
+    
+    @objc private func shareImage() {
+        guard let image = image else { return }
+        
+        let activityVC = UIActivityViewController(activityItems: [image, imageURL], applicationActivities: nil)
+        
+        // For iPad
+        if let popoverController = activityVC.popoverPresentationController {
+            popoverController.barButtonItem = navigationItem.rightBarButtonItems?[0]
+        }
+        
+        present(activityVC, animated: true)
+    }
+    @objc private func saveToPhotos() {
+        guard let image = image else { return }
+        
+        UIImageWriteToSavedPhotosAlbum(image, self, #selector(image(_:didFinishSavingWithError:contextInfo:)), nil)
+    }
+    
+    @objc private func image(_ image: UIImage, didFinishSavingWithError error: Error?, contextInfo: UnsafeRawPointer) {
+        if let error = error {
+            showErrorAlert(message: error.localizedDescription)
+        } else {
+            let alert = UIAlertController(
+                title: NSLocalizedString("Saved", comment: "Save success title"),
+                message: NSLocalizedString("Image has been saved to your photos", comment: "Save success message"),
+                preferredStyle: .alert
+            )
+            alert.addAction(UIAlertAction(title: NSLocalizedString("OK", comment: "OK button"), style: .default))
+            present(alert, animated: true)
+        }
+    }
+    
+    @objc private func dismiss(_ sender: UIBarButtonItem) {
+        dismiss(animated: true)
+    }
+    
+    // MARK: - Helper Methods
+    
+    private func showErrorAlert(message: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            
+            let alert = UIAlertController(
+                title: NSLocalizedString("Error", comment: "Error title"),
+                message: message,
+                preferredStyle: .alert
+            )
+            alert.addAction(UIAlertAction(title: NSLocalizedString("OK", comment: "OK button"), style: .default))
+            self.present(alert, animated: true)
+        }
+    }
+}
+
+// MARK: - UIScrollViewDelegate
+
+extension ImageViewerViewController: UIScrollViewDelegate {
+    func viewForZooming(in scrollView: UIScrollView) -> UIView? {
+        return imageView
+    }
+    
+    func scrollViewDidZoom(_ scrollView: UIScrollView) {
+        // Center the image when zooming
+        let offsetX = max((scrollView.bounds.width - scrollView.contentSize.width) * 0.5, 0)
+        let offsetY = max((scrollView.bounds.height - scrollView.contentSize.height) * 0.5, 0)
+        
+        scrollView.contentInset = UIEdgeInsets(top: offsetY, left: offsetX, bottom: 0, right: 0)
+    }
+}
+// MARK: - FolderPickerViewController
+
+protocol FolderPickerDelegate: AnyObject {
+    func folderPicker(_ folderPicker: FolderPickerViewController, didSelectFolder folderURL: URL)
+}
+
+class FolderPickerViewController: UIViewController {
+    
+    // MARK: - Properties
+    
+    private let rootDirectory: URL
+    private var currentDirectory: URL
+    private var folderList: [String] = []
+    private let fileManager = FileManager.default
+    weak var delegate: FolderPickerDelegate?
+    
+    // MARK: - UI Components
+    
+    private let tableView: UITableView = {
+        let tableView = UITableView()
+        tableView.translatesAutoresizingMaskIntoConstraints = false
+        return tableView
+    }()
+    
+    // MARK: - Initialization
+    
+    init(rootDirectory: URL, currentDirectory: URL) {
+        self.rootDirectory = rootDirectory
+        self.currentDirectory = currentDirectory
+        super.init(nibName: nil, bundle: nil)
+    }
+    
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+    // MARK: - Lifecycle Methods
+    
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        setupUI()
+        configureNavigationBar()
+        loadFolders()
+    }
+    
+    // MARK: - UI Setup
+    
+    private func setupUI() {
+        view.backgroundColor = .systemBackground
+        
+        // Register cell
+        tableView.register(UITableViewCell.self, forCellReuseIdentifier: "FolderCell")
+        
+        // Set delegates
+        tableView.delegate = self
+        tableView.dataSource = self
+        
+        // Add table view
+        view.addSubview(tableView)
+        
+        // Set constraints
+        NSLayoutConstraint.activate([
+            tableView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            tableView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            tableView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            tableView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor)
+        ])
+    }
+    
+    private func configureNavigationBar() {
+        title = NSLocalizedString("Select Folder", comment: "Folder picker title")
+        
+        // Add cancel button
+        let cancelButton = UIBarButtonItem(barButtonSystemItem: .cancel, target: self, action: #selector(cancel))
+        navigationItem.leftBarButtonItem = cancelButton
+        
+        // Add select button
+        let selectButton = UIBarButtonItem(title: NSLocalizedString("Select", comment: "Select button"), style: .done, target: self, action: #selector(selectCurrentFolder))
+        navigationItem.rightBarButtonItem = selectButton
+        
+        // Add new folder button
+        let newFolderButton = UIBarButtonItem(barButtonSystemItem: .add, target: self, action: #selector(createNewFolder))
+        navigationItem.rightBarButtonItems = [selectButton, newFolderButton]
+    }
+    // MARK: - Data Loading
+    
+    private func loadFolders() {
+        do {
+            let contents = try fileManager.contentsOfDirectory(at: currentDirectory, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])
+            
+            // Filter to only include directories
+            folderList = contents.compactMap { url in
+                do {
+                    let resourceValues = try url.resourceValues(forKeys: [.isDirectoryKey])
+                    return resourceValues.isDirectory == true ? url.lastPathComponent : nil
+                } catch {
+                    return nil
+                }
+            }.sorted()
+            
+            tableView.reloadData()
+            
+            // Update title
+            title = currentDirectory.lastPathComponent
+        } catch {
+            showErrorAlert(message: error.localizedDescription)
+        }
+    }
+    
+    // MARK: - Actions
+    
+    @objc private func cancel() {
+        dismiss(animated: true)
+    }
+    
+    @objc private func selectCurrentFolder() {
+        delegate?.folderPicker(self, didSelectFolder: currentDirectory)
+        dismiss(animated: true)
+    }
+    
+    @objc private func createNewFolder() {
+        let alert = UIAlertController(
+            title: NSLocalizedString("New Folder", comment: "New folder title"),
+            message: NSLocalizedString("Enter a name for the new folder", comment: "New folder message"),
+            preferredStyle: .alert
+        )
+        
+        alert.addTextField { textField in
+            textField.placeholder = NSLocalizedString("Folder Name", comment: "Folder name placeholder")
+        }
+        
+        alert.addAction(UIAlertAction(title: NSLocalizedString("Cancel", comment: "Cancel button"), style: .cancel))
+        
+        alert.addAction(UIAlertAction(title: NSLocalizedString("Create", comment: "Create button"), style: .default) { [weak self, weak alert] _ in
+            guard let self = self, let folderName = alert?.textFields?.first?.text, !folderName.isEmpty else { return }
+            
+            let newFolderURL = self.currentDirectory.appendingPathComponent(folderName)
+            
+            do {
+                try self.fileManager.createDirectory(at: newFolderURL, withIntermediateDirectories: false, attributes: nil)
+                self.loadFolders()
+            } catch {
+                self.showErrorAlert(message: error.localizedDescription)
+            }
+        })
+        
+        present(alert, animated: true)
+    }
+    // MARK: - Helper Methods
+    
+    private func navigateToFolder(at index: Int) {
+        guard index < folderList.count else { return }
+        
+        let folderName = folderList[index]
+        let folderURL = currentDirectory.appendingPathComponent(folderName)
+        
+        currentDirectory = folderURL
+        loadFolders()
+    }
+    
+    private func navigateUp() {
+        // Don't go above root directory
+        if currentDirectory.path != rootDirectory.path {
+            currentDirectory = currentDirectory.deletingLastPathComponent()
+            loadFolders()
+        }
+    }
+    
+    private func showErrorAlert(message: String) {
+        let alert = UIAlertController(
+            title: NSLocalizedString("Error", comment: "Error title"),
+            message: message,
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: NSLocalizedString("OK", comment: "OK button"), style: .default))
+        present(alert, animated: true)
+    }
+}
+
+// MARK: - UITableViewDataSource
+
+extension FolderPickerViewController: UITableViewDataSource {
+    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+        // Add 1 for the "Parent Directory" option if we're not at the root
+        return currentDirectory.path != rootDirectory.path ? folderList.count + 1 : folderList.count
+    }
+    
+    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        let cell = tableView.dequeueReusableCell(withIdentifier: "FolderCell", for: indexPath)
+        
+        if currentDirectory.path != rootDirectory.path && indexPath.row == 0 {
+            // Parent directory option
+            cell.textLabel?.text = NSLocalizedString("../ (Parent Directory)", comment: "Parent directory")
+            cell.imageView?.image = UIImage(systemName: "arrow.up.doc.fill")
+        } else {
+            // Adjust index if we have parent directory option
+            let folderIndex = currentDirectory.path != rootDirectory.path ? indexPath.row - 1 : indexPath.row
+            
+            if folderIndex < folderList.count {
+                cell.textLabel?.text = folderList[folderIndex]
+                cell.imageView?.image = UIImage(systemName: "folder")
+            }
+        }
+        
+        return cell
+    }
+}
