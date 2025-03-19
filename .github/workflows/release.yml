@@ -1,15 +1,14 @@
 name: Create New Release
 
 on:
-
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-latest # Using the latest macOS runner which includes the latest Xcode
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4 # Update to the latest version of checkout action
 
       - name: Install dependencies (packages)
         run: |
@@ -26,6 +25,7 @@ jobs:
       - name: Get Version Number
         id: get_version
         run: |
+          # Assuming the path to Info.plist remains the same
           VERSION=$( /usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" Payload/feather.app/Info.plist )
           echo "VERSION=${VERSION}" >> $GITHUB_ENV
 
@@ -45,4 +45,4 @@ jobs:
           fail_on_unmatched_files: true
           draft: true
         env:
-          GITHUB_TOKEN: ${{ env.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Corrected to use secrets.GITHUB_TOKEN
