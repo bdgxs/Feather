@@ -13,7 +13,20 @@ APP_TMP         = $(TMPDIR)/$(NAME)
 STAGE_DIR   = $(APP_TMP)/stage
 APP_DIR 	   = $(APP_TMP)/Build/Products/$(RELEASE)/$(NAME).app
 
-all: package
+# Source files
+SOURCES = iOS/Views/Home/Controllers/HomeViewController.swift iOS/Delegates/HomeDelegate.swift
+
+all: check_sources package
+
+check_sources:
+	@echo "Checking source files..."
+	@for file in $(SOURCES); do \
+		if [ ! -f $$file ]; then \
+			echo "Error: Source file $$file not found!"; \
+			exit 1; \
+		fi \
+	done
+	@echo "All source files are present."
 
 package:
 	@rm -rf $(APP_TMP)
@@ -57,5 +70,3 @@ clean:
 	@rm -rf $(APP_TMP)
 
 .PHONY: apple-include
-
-
