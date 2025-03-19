@@ -1,0 +1,38 @@
+name: Upload Ignored Files
+
+on:
+  workflow_dispatch:
+
+jobs:
+  upload-ignored-files:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: List ignored files
+      run: |
+        git ls-files --others --ignored --exclude-standard > ignored-files.txt
+        cat ignored-files.txt
+
+    - name: Create a release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: files
+        release_name: Ignored Files Release
+        draft: false
+        prerelease: false
+
+    - name: Upload ignored files to release
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ignored-files.txt
+        asset_name: ignored-files.txt
+        asset_content_type: text/plain
