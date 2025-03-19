@@ -2,7 +2,7 @@ import UIKit
 import ZIPFoundation
 import Foundation
 
-class HomeViewController: UIViewController, UISearchResultsUpdating, UITableViewDragDelegate, UITableViewDropDelegate, UITableViewDelegate, UITableViewDataSource {
+class HomeViewController: UIViewController, UISearchResultsUpdating, UITableViewDragDelegate, UITableViewDropDelegate, UITableViewDelegate, UITableViewDataSource, HomeDelegate {
 
     // MARK: - Properties
     private var fileList: [String] = []
@@ -12,6 +12,8 @@ class HomeViewController: UIViewController, UISearchResultsUpdating, UITableView
     private var sortOrder: SortOrder = .name
     let fileHandlers = HomeViewFileHandlers()
     let utilities = HomeViewUtilities()
+    
+    weak var homeDelegate: HomeDelegate?
 
     var documentsDirectory: URL {
         let directory = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first!.appendingPathComponent("files")
@@ -33,6 +35,24 @@ class HomeViewController: UIViewController, UISearchResultsUpdating, UITableView
         setupActivityIndicator()
         loadFiles()
         configureTableView()
+        homeDelegate = self
+    }
+
+    // MARK: - HomeDelegate Methods
+    func didAddFile(file: String) {
+        fileList.append(file)
+        fileListTableView.reloadData()
+    }
+
+    func didRemoveFile(file: String) {
+        if let index = fileList.firstIndex(of: file) {
+            fileList.remove(at: index)
+            fileListTableView.reloadData()
+        }
+    }
+
+    func didUpdateFile(file: String) {
+        // Handle file update logic
     }
 
     // MARK: - UI Setup
