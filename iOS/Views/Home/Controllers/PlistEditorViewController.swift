@@ -67,9 +67,11 @@ class PlistEditorViewController: UIViewController, UITextViewDelegate {
     private func loadFileContent() {
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                let fileContent = try String(contentsOf: self.fileURL)
+                let data = try Data(contentsOf: self.fileURL)
+                let plist = try PropertyListSerialization.propertyList(from: data, options: [], format: nil)
+                let plistString = String(describing: plist)
                 DispatchQueue.main.async {
-                    self.textView.text = fileContent
+                    self.textView.text = plistString
                 }
             } catch {
                 DispatchQueue.main.async {
@@ -80,10 +82,11 @@ class PlistEditorViewController: UIViewController, UITextViewDelegate {
     }
 
     @objc private func saveChanges() {
-        guard let newText = textView.text else { return }
+        guard let text = textView.text else { return }
+        let plist = text.data(using: .utf8)!
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                try newText.write(to: self.fileURL, atomically: true, encoding: .utf8)
+                try plist.write(to: self.fileURL)
                 self.hasUnsavedChanges = false
                 DispatchQueue.main.async {
                     self.presentAlert(title: "Success", message: "File saved successfully.")
