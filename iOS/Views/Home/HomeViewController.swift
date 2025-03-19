@@ -2631,3 +2631,22 @@ extension FolderPickerViewController: UITableViewDataSource {
         return cell
     }
 }
+// MARK: - UITableViewDelegate
+
+extension FolderPickerViewController: UITableViewDelegate {
+    func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+        tableView.deselectRow(at: indexPath, animated: true)
+        
+        if currentDirectory.path != rootDirectory.path && indexPath.row == 0 {
+            // Navigate to parent directory
+            navigateUp()
+        } else {
+            // Adjust index if we have parent directory option
+            let folderIndex = currentDirectory.path != rootDirectory.path ? indexPath.row - 1 : indexPath.row
+            
+            if folderIndex < folderList.count {
+                navigateToFolder(at: folderIndex)
+            }
+        }
+    }
+}
