@@ -1,5 +1,9 @@
 import UIKit
 
+protocol HomeDelegate {
+    func didUpdateFile(file: String)
+}
+
 class HomeViewController: UIViewController, UISearchResultsUpdating, UITableViewDragDelegate, UITableViewDropDelegate, UITableViewDelegate, UITableViewDataSource, HomeDelegate {
 
     // Implementation of HomeViewController
