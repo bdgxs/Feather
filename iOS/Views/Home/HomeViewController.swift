@@ -3,12 +3,24 @@ import ZIPFoundation
 import Foundation
 import os.log
 import UniformTypeIdentifiers
+import CoreData
+import WebKit
 
 // MARK: - Protocols
+
 protocol FileHandlingDelegate: AnyObject {
     func present(_ viewControllerToPresent: UIViewController, animated flag: Bool, completion: (() -> Void)?)
     func loadFiles()
     var documentsDirectory: URL { get }
+}
+
+protocol DownloadDelegate: AnyObject {
+    func downloadProgress(progress: Float)
+    func downloadDidFinish(fileURL: URL)
+    func downloadDidFail(with error: Error)
+    func extractionProgress(progress: Float)
+    func extractionDidFinish(directoryURL: URL)
+    func extractionDidFail(with error: Error)
 }
 
 class HomeViewController: UIViewController {
@@ -19,6 +31,21 @@ class HomeViewController: UIViewController {
     private let fileManager = FileManager.default
     private let searchController = UISearchController(searchResultsController: nil)
     private var sortOrder: SortOrder = .name
+    private var lastSortOrder: SortOrder = .name
+    private var isRefreshing = false
+    private var selectedFiles: [String] = []
+    private var isMultiSelectMode = false
+    
+    // App download and IPA handling
+    private var appDownloader: AppDownload?
+    private var downloadProgress: Float = 0.0
+    private var extractionProgress: Float = 0.0
+    private var currentDownloadTask: URLSessionDownloadTask?
+    private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
+    
+    // CoreData
+    private lazy var coreDataManager = CoreDataManager.shared
+    
     let fileHandlers = HomeViewFileHandlers()
     let utilities = HomeViewUtilities()
     
@@ -28,40 +55,91 @@ class HomeViewController: UIViewController {
         return directory
     }
     
+    // Current directory path for navigation
+    var currentDirectoryPath: URL
+    
     enum SortOrder {
         case name, date, size
     }
     
+    // UI Components
     let fileListTableView = UITableView()
     let activityIndicator = UIActivityIndicatorView(style: .large)
+    let progressView = UIProgressView(progressViewStyle: .bar)
+    let refreshControl = UIRefreshControl()
+    let multiSelectButton = UIBarButtonItem(title: "Select", style: .plain, target: nil, action: nil)
+    let cancelButton = UIBarButtonItem(barButtonSystemItem: .cancel, target: nil, action: nil)
+    let actionButton = UIBarButtonItem(barButtonSystemItem: .action, target: nil, action: nil)
+    
+    // MARK: - Initialization
+    
+    init(directoryPath: URL? = nil) {
+        self.currentDirectoryPath = directoryPath ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!.appendingPathComponent("files")
+        super.init(nibName: nil, bundle: nil)
+    }
+    
+    required init?(coder: NSCoder) {
+        self.currentDirectoryPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!.appendingPathComponent("files")
+        super.init(coder: coder)
+    }
     
     // MARK: - Lifecycle
     override func viewDidLoad() {
         super.viewDidLoad()
         setupUI()
         setupActivityIndicator()
+        setupProgressView()
+        setupRefreshControl()
+        setupMultiSelectButtons()
         loadFiles()
         configureTableView()
+        registerForNotifications()
     }
     
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        // Refresh files when view appears
+        if !isRefreshing {
+            loadFiles()
+        }
+    }
+    
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+        cancelBackgroundTask()
+    }
     // MARK: - UI Setup
     private func setupUI() {
         view.backgroundColor = .systemBackground
         
-        let navItem = UINavigationItem(title: "Files")
+        // Set title based on current directory
+        title = currentDirectoryPath.lastPathComponent
+        
+        // Navigation bar setup
         let menuButton = UIBarButtonItem(image: UIImage(systemName: "ellipsis.circle"), style: .plain, target: self, action: #selector(showMenu))
         let uploadButton = UIBarButtonItem(image: UIImage(systemName: "square.and.arrow.up"), style: .plain, target: self, action: #selector(importFile))
         let addButton = UIBarButtonItem(image: UIImage(systemName: "folder.badge.plus"), style: .plain, target: self, action: #selector(addDirectory))
         
-        navItem.rightBarButtonItems = [menuButton, uploadButton, addButton]
-        navigationController?.navigationBar.setItems([navItem], animated: false)
+        navigationItem.rightBarButtonItems = [menuButton, uploadButton, addButton]
         
+        // If not in root directory, add back button
+        if currentDirectoryPath != documentsDirectory {
+            navigationItem.leftBarButtonItem = UIBarButtonItem(
+                image: UIImage(systemName: "arrow.left"),
+                style: .plain,
+                target: self,
+                action: #selector(navigateToParentDirectory)
+            )
+        }
+        
+        // Search controller setup
         searchController.searchResultsUpdater = self
         searchController.obscuresBackgroundDuringPresentation = false
-        searchController.searchBar.placeholder = "Search Files"
+        searchController.searchBar.placeholder = NSLocalizedString("Search Files", comment: "Search bar placeholder")
         navigationItem.searchController = searchController
         definesPresentationContext = true
         
+        // Table view setup
         view.addSubview(fileListTableView)
         fileListTableView.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
@@ -75,10 +153,52 @@ class HomeViewController: UIViewController {
     private func setupActivityIndicator() {
         view.addSubview(activityIndicator)
         activityIndicator.translatesAutoresizingMaskIntoConstraints = false
+        activityIndicator.hidesWhenStopped = true
         NSLayoutConstraint.activate([
             activityIndicator.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             activityIndicator.centerYAnchor.constraint(equalTo: view.centerYAnchor)
         ])
+    }
+    
+    private func setupProgressView() {
+        progressView.progress = 0
+        progressView.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(progressView)
+        
+        NSLayoutConstraint.activate([
+            progressView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            progressView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            progressView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor)
+        ])
+        
+        progressView.isHidden = true
+    }
+    
+    private func setupRefreshControl() {
+        refreshControl.attributedTitle = NSAttributedString(string: NSLocalizedString("Pull to refresh", comment: "Pull to refresh text"))
+        refreshControl.addTarget(self, action: #selector(refreshData), for: .valueChanged)
+        fileListTableView.refreshControl = refreshControl
+    }
+    
+    private func setupMultiSelectButtons() {
+        multiSelectButton.target = self
+        multiSelectButton.action = #selector(toggleMultiSelectMode)
+        
+        cancelButton.target = self
+        cancelButton.action = #selector(cancelMultiSelect)
+        
+        actionButton.target = self
+        actionButton.action = #selector(performBatchAction)
+        actionButton.isEnabled = false
+        
+        // Add multi-select button to left items if we're in root directory
+        if currentDirectoryPath == documentsDirectory {
+            navigationItem.leftBarButtonItem = multiSelectButton
+        } else {
+            // Add it to the right items if we're in a subdirectory
+            let rightItems = navigationItem.rightBarButtonItems ?? []
+            navigationItem.rightBarButtonItems = rightItems + [multiSelectButton]
+        }
     }
     
     private func configureTableView() {
@@ -87,7 +207,9 @@ class HomeViewController: UIViewController {
         fileListTableView.dragDelegate = self
         fileListTableView.dropDelegate = self
         fileListTableView.dragInteractionEnabled = true
+        fileListTableView.allowsMultipleSelection = false
         fileListTableView.register(FileTableViewCell.self, forCellReuseIdentifier: "FileCell")
+        fileListTableView.register(AppTableViewCell.self, forCellReuseIdentifier: "AppCell")
         fileListTableView.rowHeight = 70
     }
     
@@ -96,588 +218,1386 @@ class HomeViewController: UIViewController {
             do {
                 try fileManager.createDirectory(at: directory, withIntermediateDirectories: true, attributes: nil)
             } catch {
-                utilities.handleError(in: self, error: error, withTitle: "Directory Creation Failed")
+                utilities.handleError(in: self, error: error, withTitle: NSLocalizedString("Directory Creation Failed", comment: "Error title"))
             }
         }
     }
     
-    // MARK: - File Operations
-    func loadFiles() {
-        activityIndicator.startAnimating()
-        DispatchQueue.global().async { [weak self] in
-            guard let self = self else { return }
-            do {
-                let files = try self.fileManager.contentsOfDirectory(atPath: self.documentsDirectory.path)
-                DispatchQueue.main.async {
-                    self.fileList = files
-                    self.sortFiles()
-                    self.fileListTableView.reloadData()
-                    self.activityIndicator.stopAnimating()
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    self.activityIndicator.stopAnimating()
-                    self.utilities.handleError(in: self, error: error, withTitle: "Failed to Load Files")
-                }
-            }
-        }
-    }
-    
-    @objc private func importFile() {
-        let documentTypes: [UTType] = [.zip, .item, .content, .data, .text, .image]
-        let documentPicker = UIDocumentPickerViewController(forOpeningContentTypes: documentTypes)
-        documentPicker.delegate = self
-        documentPicker.allowsMultipleSelection = true
-        present(documentPicker, animated: true, completion: nil)
-    }
-    
-    func handleImportedFile(url: URL) {
-        let destinationURL = documentsDirectory.appendingPathComponent(url.lastPathComponent)
+    private func registerForNotifications() {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appDidEnterBackground),
+            name: UIApplication.didEnterBackgroundNotification,
+            object: nil
+        )
         
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appWillEnterForeground),
+            name: UIApplication.willEnterForegroundNotification,
+            object: nil
+        )
+    }
+    // MARK: - File Operations
+    
+    func loadFiles() {
+        isRefreshing = true
         activityIndicator.startAnimating()
+        
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             
             do {
-                if url.startAccessingSecurityScopedResource() {
-                    defer { url.stopAccessingSecurityScopedResource() }
+                let fileURLs = try self.fileManager.contentsOfDirectory(at: self.currentDirectoryPath, includingPropertiesForKeys: [.isDirectoryKey, .contentModificationDateKey, .fileSizeKey], options: [.skipsHiddenFiles])
+                
+                self.fileList = fileURLs.map { $0.lastPathComponent }
+                self.sortFiles()
+                
+                DispatchQueue.main.async {
+                    self.activityIndicator.stopAnimating()
+                    self.fileListTableView.reloadData()
+                    self.refreshControl.endRefreshing()
+                    self.isRefreshing = false
                     
-                    if url.pathExtension.lowercased() == "zip" {
-                        try self.fileManager.unzipItem(at: url, to: self.documentsDirectory)
+                    // Show empty state if needed
+                    if self.fileList.isEmpty {
+                        self.showEmptyState()
                     } else {
-                        if self.fileManager.fileExists(atPath: destinationURL.path) {
-                            try self.fileManager.removeItem(at: destinationURL)
-                        }
-                        try self.fileManager.copyItem(at: url, to: destinationURL)
-                    }
-                    
-                    DispatchQueue.main.async {
-                        self.activityIndicator.stopAnimating()
-                        self.loadFiles()
+                        self.hideEmptyState()
                     }
                 }
             } catch {
                 DispatchQueue.main.async {
                     self.activityIndicator.stopAnimating()
-                    self.utilities.handleError(in: self, error: error, withTitle: "Import Failed")
+                    self.refreshControl.endRefreshing()
+                    self.isRefreshing = false
+                    self.utilities.handleError(in: self, error: error, withTitle: NSLocalizedString("Failed to Load Files", comment: "Error title"))
                 }
             }
         }
     }
     
-    func deleteFile(at index: Int) {
-        let fileToDelete = fileList[index]
-        let fileURL = documentsDirectory.appendingPathComponent(fileToDelete)
+    private func sortFiles() {
+        let fileURLs = fileList.map { currentDirectoryPath.appendingPathComponent($0) }
         
-        do {
-            try fileManager.removeItem(at: fileURL)
-            fileList.remove(at: index)
-            fileListTableView.deleteRows(at: [IndexPath(row: index, section: 0)], with: .fade)
-        } catch {
-            utilities.handleError(in: self, error: error, withTitle: "Delete Failed")
-        }
-    }
-    
-    func sortFiles() {
         switch sortOrder {
         case .name:
             fileList.sort { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+            
         case .date:
-            fileList.sort { file1, file2 in
-                let url1 = documentsDirectory.appendingPathComponent(file1)
-                let url2 = documentsDirectory.appendingPathComponent(file2)
-                
-                guard let date1 = fileManager.modificationDate(at: url1.path),
-                      let date2 = fileManager.modificationDate(at: url2.path) else {
-                    return file1.localizedCaseInsensitiveCompare(file2) == .orderedAscending
+            let sortedURLs = fileURLs.sorted { url1, url2 -> Bool in
+                do {
+                    let values1 = try url1.resourceValues(forKeys: [.contentModificationDateKey])
+                    let values2 = try url2.resourceValues(forKeys: [.contentModificationDateKey])
+                    
+                    if let date1 = values1.contentModificationDate, let date2 = values2.contentModificationDate {
+                        return date1 > date2 // Most recent first
+                    }
+                } catch {
+                    print("Error getting file dates: \(error)")
                 }
-                
-                return date1 > date2
+                return false
             }
+            fileList = sortedURLs.map { $0.lastPathComponent }
+            
         case .size:
-            fileList.sort { file1, file2 in
-                let url1 = documentsDirectory.appendingPathComponent(file1)
-                let url2 = documentsDirectory.appendingPathComponent(file2)
-                
-                guard let size1 = fileManager.fileSize(at: url1.path),
-                      let size2 = fileManager.fileSize(at: url2.path) else {
-                    return file1.localizedCaseInsensitiveCompare(file2) == .orderedAscending
+            let sortedURLs = fileURLs.sorted { url1, url2 -> Bool in
+                do {
+                    let values1 = try url1.resourceValues(forKeys: [.fileSizeKey])
+                    let values2 = try url2.resourceValues(forKeys: [.fileSizeKey])
+                    
+                    if let size1 = values1.fileSize, let size2 = values2.fileSize {
+                        return size1 > size2 // Largest first
+                    }
+                } catch {
+                    print("Error getting file sizes: \(error)")
                 }
-                
-                return size1 > size2
+                return false
             }
-        }
-    }
-    
-    // MARK: - UI Actions
-    @objc private func showMenu() {
-        let alertController = UIAlertController(title: "Sort By", message: nil, preferredStyle: .actionSheet)
-        
-        let sortByNameAction = UIAlertAction(title: "Name", style: .default) { [weak self] _ in
-            self?.sortOrder = .name
-            self?.sortFiles()
-            self?.fileListTableView.reloadData()
-        }
-        alertController.addAction(sortByNameAction)
-        
-        let sortByDateAction = UIAlertAction(title: "Date (Newest First)", style: .default) { [weak self] _ in
-            self?.sortOrder = .date
-            self?.sortFiles()
-            self?.fileListTableView.reloadData()
-        }
-        alertController.addAction(sortByDateAction)
-        
-        let sortBySizeAction = UIAlertAction(title: "Size (Largest First)", style: .default) { [weak self] _ in
-            self?.sortOrder = .size
-            self?.sortFiles()
-            self?.fileListTableView.reloadData()
-        }
-        alertController.addAction(sortBySizeAction)
-        
-        alertController.addAction(UIAlertAction(title: "Cancel", style: .cancel, handler: nil))
-        
-        // For iPad support
-        if let popoverController = alertController.popoverPresentationController {
-            popoverController.barButtonItem = navigationItem.rightBarButtonItems?.first
+            fileList = sortedURLs.map { $0.lastPathComponent }
         }
         
-        present(alertController, animated: true, completion: nil)
-    }
-    
-    @objc private func addDirectory() {
-        let alertController = UIAlertController(title: "New Directory", message: "Enter directory name:", preferredStyle: .alert)
-        alertController.addTextField { textField in
-            textField.placeholder = "Directory Name"
+        // Always put directories first
+        let directoryFiles = fileList.filter { fileName in
+            let fileURL = currentDirectoryPath.appendingPathComponent(fileName)
+            var isDirectory: ObjCBool = false
+            fileManager.fileExists(atPath: fileURL.path, isDirectory: &isDirectory)
+            return isDirectory.boolValue
         }
-        let createAction = UIAlertAction(title: "Create", style: .default) { [weak self] _ in
-            guard let self = self,
-                  let directoryName = alertController.textFields?.first?.text,
-                  !directoryName.isEmpty else {
-                return
-            }
-            
-            let newDirectoryURL = self.documentsDirectory.appendingPathComponent(directoryName)
-            
-            do {
-                try self.fileManager.createDirectory(at: newDirectoryURL, withIntermediateDirectories: false, attributes: nil)
-                self.loadFiles()
-            } catch {
-                self.utilities.handleError(in: self, error: error, withTitle: "Directory Creation Failed")
-            }
+        
+        let nonDirectoryFiles = fileList.filter { fileName in
+            let fileURL = currentDirectoryPath.appendingPathComponent(fileName)
+            var isDirectory: ObjCBool = false
+            fileManager.fileExists(atPath: fileURL.path, isDirectory: &isDirectory)
+            return !isDirectory.boolValue
         }
-        alertController.addAction(createAction)
-        alertController.addAction(UIAlertAction(title: "Cancel", style: .cancel, handler: nil))
-        present(alertController, animated: true, completion: nil)
-    }
-    
-    // MARK: - File Handling Methods
-    func showFileOptions(for fileURL: URL) {
-        let isDirectory = fileManager.isDirectory(at: fileURL)
-        let fileName = fileURL.lastPathComponent
         
-        let alertController = UIAlertController(title: fileName, message: nil, preferredStyle: .actionSheet)
+        fileList = directoryFiles + nonDirectoryFiles
         
-        if isDirectory {
-            // Directory options
-            alertController.addAction(UIAlertAction(title: "Open", style: .default) { [weak self] _ in
-                self?.openDirectory(at: fileURL)
-            })
+        // Update filtered list if search is active
+        if searchController.isActive && !(searchController.searchBar.text?.isEmpty ?? true) {
+            filterContentForSearchText(searchController.searchBar.text!)
         } else {
-            // File options
-            alertController.addAction(UIAlertAction(title: "Open", style: .default) { [weak self] _ in
-                self?.openFile(at: fileURL)
-            })
-            
-            alertController.addAction(UIAlertAction(title: "Edit", style: .default) { [weak self] _ in
-                self?.editFile(at: fileURL)
-            })
-            
-            alertController.addAction(UIAlertAction(title: "Share", style: .default) { [weak self] _ in
-                self?.shareFile(at: fileURL)
-            })
+            filteredFileList = fileList
         }
-        
-        // Common options
-        alertController.addAction(UIAlertAction(title: "Rename", style: .default) { [weak self] _ in
-            self?.promptRename(for: fileURL)
-        })
-        
-        alertController.addAction(UIAlertAction(title: "Delete", style: .destructive) { [weak self] _ in
-            self?.promptDelete(for: fileURL)
-        })
-        
-        alertController.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        
-        // For iPad support
-        if let popoverController = alertController.popoverPresentationController {
-            popoverController.sourceView = view
-            popoverController.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0)
-            popoverController.permittedArrowDirections = []
-        }
-        
-        present(alertController, animated: true)
     }
     
-    func openDirectory(at directoryURL: URL) {
-        let directoryVC = HomeViewController()
-        directoryVC.title = directoryURL.lastPathComponent
-        // Set up a custom documentsDirectory property for the new VC
-        navigationController?.pushViewController(directoryVC, animated: true)
-    }
-    
-    func openFile(at fileURL: URL) {
-        let pathExtension = fileURL.pathExtension.lowercased()
+    func openFile(at indexPath: IndexPath) {
+        let fileList = searchController.isActive ? filteredFileList : self.fileList
+        guard indexPath.row < fileList.count else { return }
         
-        switch pathExtension {
-        case "txt", "log", "json", "md", "xml", "html", "css", "js":
-            let textEditor = TextEditorViewController(fileURL: fileURL)
-            navigationController?.pushViewController(textEditor, animated: true)
-        case "plist":
-            let plistEditor = PlistEditorViewController(fileURL: fileURL)
-            navigationController?.pushViewController(plistEditor, animated: true)
-        case "jpg", "jpeg", "png", "gif":
-            let imageViewer = ImageViewerViewController(fileURL: fileURL)
-            navigationController?.pushViewController(imageViewer, animated: true)
+        let fileName = fileList[indexPath.row]
+        let fileURL = currentDirectoryPath.appendingPathComponent(fileName)
+        
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: fileURL.path, isDirectory: &isDirectory) else {
+            utilities.showAlert(in: self, title: NSLocalizedString("Error", comment: "Error title"), message: NSLocalizedString("File no longer exists", comment: "File missing message"))
+            loadFiles() // Refresh to update the list
+            return
+        }
+        
+        if isDirectory.boolValue {
+            // Navigate to directory
+            let directoryVC = HomeViewController(directoryPath: fileURL)
+            navigationController?.pushViewController(directoryVC, animated: true)
+            return
+        }
+        
+        // Handle file based on extension
+        let fileExtension = fileURL.pathExtension.lowercased()
+        
+        switch fileExtension {
+        case "ipa":
+            handleIPAFile(at: fileURL)
+            
+        case "txt", "log", "json", "xml", "plist", "html", "css", "js", "swift", "m", "h", "c", "cpp":
+            openTextFile(at: fileURL)
+            
+        case "jpg", "jpeg", "png", "gif", "heic", "heif", "webp":
+            openImageFile(at: fileURL)
+            
+        case "mp4", "mov", "m4v", "3gp":
+            openVideoFile(at: fileURL)
+            
         case "pdf":
-            let pdfViewer = PDFViewerViewController(fileURL: fileURL)
-            navigationController?.pushViewController(pdfViewer, animated: true)
-        default:
-            // Use document interaction controller for other file types
-            let documentInteractionController = UIDocumentInteractionController(url: fileURL)
-            documentInteractionController.delegate = self
-            documentInteractionController.presentPreview(animated: true)
-    func editFile(at fileURL: URL) {
-        let pathExtension = fileURL.pathExtension.lowercased()
-        
-        switch pathExtension {
-        case "txt", "log", "json", "md", "xml", "html", "css", "js":
-            let textEditor = TextEditorViewController(fileURL: fileURL)
-            navigationController?.pushViewController(textEditor, animated: true)
-        case "plist":
-            let plistEditor = PlistEditorViewController(fileURL: fileURL)
-            navigationController?.pushViewController(plistEditor, animated: true)
-        default:
-            let hexEditor = HexEditorViewController(fileURL: fileURL)
-            navigationController?.pushViewController(hexEditor, animated: true)
-        }
-    }
-    
-    func shareFile(at fileURL: URL) {
-        let activityViewController = UIActivityViewController(activityItems: [fileURL], applicationActivities: nil)
-        
-        // For iPad support
-        if let popoverController = activityViewController.popoverPresentationController {
-            popoverController.sourceView = view
-            popoverController.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0)
-            popoverController.permittedArrowDirections = []
-        }
-        
-        present(activityViewController, animated: true)
-    }
-    
-    func promptRename(for fileURL: URL) {
-        let alertController = UIAlertController(title: "Rename", message: "Enter new name:", preferredStyle: .alert)
-        alertController.addTextField { textField in
-            textField.text = fileURL.lastPathComponent
-        }
-        
-        let renameAction = UIAlertAction(title: "Rename", style: .default) { [weak self] _ in
-            guard let self = self, let newName = alertController.textFields?.first?.text, !newName.isEmpty else {
-                return
-            }
+            openPDFFile(at: fileURL)
             
-            let newURL = fileURL.deletingLastPathComponent().appendingPathComponent(newName)
+        case "zip":
+            handleZipFile(at: fileURL)
             
-            do {
-                try self.fileManager.moveItem(at: fileURL, to: newURL)
-                self.loadFiles()
-            } catch {
-                self.utilities.handleError(in: self, error: error, withTitle: "Rename Failed")
+        case "bin", "dat", "hex":
+            openHexEditor(for: fileURL)
+            
+        default:
+            // Try to determine file type by UTI
+            if let uti = UTType(filenameExtension: fileExtension) {
+                if uti.conforms(to: .text) {
+                    openTextFile(at: fileURL)
+                } else if uti.conforms(to: .image) {
+                    openImageFile(at: fileURL)
+                } else if uti.conforms(to: .movie) {
+                    openVideoFile(at: fileURL)
+                } else if uti.conforms(to: .pdf) {
+                    openPDFFile(at: fileURL)
+                } else if uti.conforms(to: .archive) {
+                    handleZipFile(at: fileURL)
+                } else {
+                    // Unknown file type - show preview if possible
+                    let previewController = UIDocumentInteractionController(url: fileURL)
+                    previewController.delegate = self
+                    if !previewController.presentPreview(animated: true) {
+                        // If preview not available, show options
+                        previewController.presentOptionsMenu(from: view.bounds, in: view, animated: true)
+                    }
+                }
+            } else {
+                // Unknown file type - show options
+                let previewController = UIDocumentInteractionController(url: fileURL)
+                previewController.delegate = self
+                previewController.presentOptionsMenu(from: view.bounds, in: view, animated: true)
             }
         }
-        
-        alertController.addAction(renameAction)
-        alertController.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        
-        present(alertController, animated: true)
     }
     
-    func promptDelete(for fileURL: URL) {
-        let alertController = UIAlertController(
-            title: "Delete \(fileURL.lastPathComponent)?",
-            message: "This action cannot be undone.",
-            preferredStyle: .alert
+    private func handleIPAFile(at fileURL: URL) {
+        let alert = UIAlertController(
+            title: NSLocalizedString("IPA File", comment: "IPA file alert title"),
+            message: NSLocalizedString("What would you like to do with this IPA file?", comment: "IPA options message"),
+            preferredStyle: .actionSheet
         )
         
-        let deleteAction = UIAlertAction(title: "Delete", style: .destructive) { [weak self] _ in
+        alert.addAction(UIAlertAction(title: NSLocalizedString("Extract", comment: "Extract action"), style: .default) { [weak self] _ in
+            self?.extractIPA(at: fileURL)
+        })
+        
+        alert.addAction(UIAlertAction(title: NSLocalizedString("View Info", comment: "View info action"), style: .default) { [weak self] _ in
+            self?.showIPAInfo(for: fileURL)
+        })
+        
+        alert.addAction(UIAlertAction(title: NSLocalizedString("Cancel", comment: "Cancel button"), style: .cancel))
+        
+        // For iPad
+        if let popoverController = alert.popoverPresentationController {
+            popoverController.sourceView = view
+            popoverController.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0)
+            popoverController.permittedArrowDirections = []
+        }
+        
+        present(alert, animated: true)
+    }
+    // MARK: - File Type Handlers
+    
+    private func openTextFile(at fileURL: URL) {
+        do {
+            let text = try String(contentsOf: fileURL, encoding: .utf8)
+            let textEditorVC = TextEditorViewController(fileURL: fileURL, text: text)
+            textEditorVC.delegate = self
+            let navController = UINavigationController(rootViewController: textEditorVC)
+            present(navController, animated: true)
+        } catch {
+            // Try other encodings if UTF-8 fails
+            do {
+                let text = try String(contentsOf: fileURL, encoding: .isoLatin1)
+                let textEditorVC = TextEditorViewController(fileURL: fileURL, text: text)
+                textEditorVC.delegate = self
+                let navController = UINavigationController(rootViewController: textEditorVC)
+                present(navController, animated: true)
+            } catch {
+                utilities.handleError(in: self, error: error, withTitle: NSLocalizedString("Failed to Open Text File", comment: "Error title"))
+            }
+        }
+    }
+    
+    private func openImageFile(at fileURL: URL) {
+        let imageViewer = ImageViewerViewController(imageURL: fileURL)
+        let navController = UINavigationController(rootViewController: imageViewer)
+        present(navController, animated: true)
+    }
+    
+    private func openVideoFile(at fileURL: URL) {
+        let videoPlayer = VideoPlayerViewController(videoURL: fileURL)
+        let navController = UINavigationController(rootViewController: videoPlayer)
+        present(navController, animated: true)
+    }
+    
+    private func openPDFFile(at fileURL: URL) {
+        let pdfViewer = PDFViewerViewController(pdfURL: fileURL)
+        let navController = UINavigationController(rootViewController: pdfViewer)
+        present(navController, animated: true)
+    }
+    
+    private func openHexEditor(for fileURL: URL) {
+        let hexEditor = HexEditorViewController(fileURL: fileURL)
+        let navController = UINavigationController(rootViewController: hexEditor)
+        present(navController, animated: true)
+    }
+    
+    private func handleZipFile(at fileURL: URL) {
+        let alert = UIAlertController(
+            title: NSLocalizedString("ZIP File", comment: "ZIP file alert title"),
+            message: NSLocalizedString("What would you like to do with this ZIP file?", comment: "ZIP options message"),
+            preferredStyle: .actionSheet
+        )
+        
+        alert.addAction(UIAlertAction(title: NSLocalizedString("Extract", comment: "Extract action"), style: .default) { [weak self] _ in
+            self?.extractZip(at: fileURL)
+        })
+        
+        alert.addAction(UIAlertAction(title: NSLocalizedString("View Contents", comment: "View contents action"), style: .default) { [weak self] _ in
+            self?.viewZipContents(at: fileURL)
+        })
+        
+        alert.addAction(UIAlertAction(title: NSLocalizedString("Cancel", comment: "Cancel button"), style: .cancel))
+        
+        // For iPad
+        if let popoverController = alert.popoverPresentationController {
+            popoverController.sourceView = view
+            popoverController.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0)
+            popoverController.permittedArrowDirections = []
+        }
+        
+        present(alert, animated: true)
+    }
+    
+    private func extractZip(at fileURL: URL) {
+        // Create extraction destination
+        let fileName = fileURL.deletingPathExtension().lastPathComponent
+        let extractionDirectory = currentDirectoryPath.appendingPathComponent("\(fileName)_extracted")
+        
+        // Create directory if it doesn't exist
+        if !fileManager.fileExists(atPath: extractionDirectory.path) {
+            do {
+                try fileManager.createDirectory(at: extractionDirectory, withIntermediateDirectories: true, attributes: nil)
+            } catch {
+                utilities.handleError(in: self, error: error, withTitle: NSLocalizedString("Failed to Create Directory", comment: "Error title"))
+                return
+            }
+        }
+        
+        // Show progress
+        progressView.isHidden = false
+        progressView.progress = 0
+        
+        // Extract in background
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             
             do {
-                try self.fileManager.removeItem(at: fileURL)
-                self.loadFiles()
+                try self.fileManager.unzipItem(at: fileURL, to: extractionDirectory, progress: { [weak self] progress in
+                    DispatchQueue.main.async {
+                        self?.progressView.progress = Float(progress)
+                    }
+                })
+                
+                DispatchQueue.main.async {
+                    self.progressView.isHidden = true
+                    self.loadFiles()
+                    self.utilities.showAlert(in: self, title: NSLocalizedString("Success", comment: "Success title"), message: NSLocalizedString("File extracted successfully", comment: "Extraction success message"))
+                }
             } catch {
-                self.utilities.handleError(in: self, error: error, withTitle: "Delete Failed")
+                DispatchQueue.main.async {
+                    self.progressView.isHidden = true
+                    self.utilities.handleError(in: self, error: error, withTitle: NSLocalizedString("Extraction Failed", comment: "Error title"))
+                }
             }
         }
+    }
+    
+    private func viewZipContents(at fileURL: URL) {
+        let zipViewer = ZipContentsViewController(zipURL: fileURL)
+        let navController = UINavigationController(rootViewController: zipViewer)
+        present(navController, animated: true)
+    }
+    
+    private func extractIPA(at fileURL: URL) {
+        // Create extraction destination
+        let fileName = fileURL.deletingPathExtension().lastPathComponent
+        let extractionDirectory = currentDirectoryPath.appendingPathComponent("\(fileName)_extracted")
         
-        alertController.addAction(deleteAction)
-        alertController.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        
-        present(alertController, animated: true)
-    }
-}
-
-// MARK: - UISearchResultsUpdating Extension
-extension HomeViewController: UISearchResultsUpdating {
-    func updateSearchResults(for searchController: UISearchController) {
-        filterContentForSearchText(searchController.searchBar.text ?? "")
-    }
-    
-    private func filterContentForSearchText(_ searchText: String) {
-        if searchText.isEmpty {
-            filteredFileList = fileList
-        } else {
-            filteredFileList = fileList.filter { $0.lowercased().contains(searchText.lowercased()) }
-        }
-        fileListTableView.reloadData()
-    }
-}
-
-// MARK: - UITableViewDelegate, UITableViewDataSource Extensions
-extension HomeViewController: UITableViewDelegate, UITableViewDataSource {
-    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-        return searchController.isActive ? filteredFileList.count : fileList.count
-    }
-    
-    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
-        let cell = tableView.dequeueReusableCell(withIdentifier: "FileCell", for: indexPath) as! FileTableViewCell
-        let fileName = searchController.isActive ? filteredFileList[indexPath.row] : fileList[indexPath.row]
-        let fileURL = documentsDirectory.appendingPathComponent(fileName)
-        let file = File(url: fileURL)
-        cell.configure(with: file)
-        return cell
-    }
-    
-    func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
-        tableView.deselectRow(at: indexPath, animated: true)
-        let fileName = searchController.isActive ? filteredFileList[indexPath.row] : fileList[indexPath.row]
-        let fileURL = documentsDirectory.appendingPathComponent(fileName)
-        showFileOptions(for: fileURL)
-    }
-    
-    func tableView(_ tableView: UITableView, trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath) -> UISwipeActionsConfiguration? {
-        let fileName = searchController.isActive ? filteredFileList[indexPath.row] : fileList[indexPath.row]
-        let fileURL = documentsDirectory.appendingPathComponent(fileName)
-        
-        let deleteAction = UIContextualAction(style: .destructive, title: "Delete") { [weak self] (_, _, completionHandler) in
-            self?.promptDelete(for: fileURL)
-            completionHandler(true)
-        }
-        deleteAction.image = UIImage(systemName: "trash")
-        
-        let renameAction = UIContextualAction(style: .normal, title: "Rename") { [weak self] (_, _, completionHandler) in
-            self?.promptRename(for: fileURL)
-            completionHandler(true)
-        }
-        renameAction.image = UIImage(systemName: "pencil")
-        renameAction.backgroundColor = .systemBlue
-        
-        let configuration = UISwipeActionsConfiguration(actions: [deleteAction, renameAction])
-        return configuration
-    }
-}
-// MARK: - UITableViewDragDelegate Extension
-extension HomeViewController: UITableViewDragDelegate {
-    func tableView(_ tableView: UITableView, itemsForBeginning session: UIDragSession, at indexPath: IndexPath) -> [UIDragItem] {
-        let fileName = searchController.isActive ? filteredFileList[indexPath.row] : fileList[indexPath.row]
-        let fileURL = documentsDirectory.appendingPathComponent(fileName)
-        let itemProvider = NSItemProvider(contentsOf: fileURL)
-        let dragItem = UIDragItem(itemProvider: itemProvider ?? NSItemProvider())
-        dragItem.localObject = fileName
-        return [dragItem]
-    }
-    
-    func tableView(_ tableView: UITableView, dragSessionWillBegin session: UIDragSession) {
-        // Optional: Add visual feedback when drag begins
-    }
-    
-    func tableView(_ tableView: UITableView, dragSessionDidEnd session: UIDragSession) {
-        // Optional: Clean up after drag ends
-    }
-}
-
-// MARK: - UITableViewDropDelegate Extension
-extension HomeViewController: UITableViewDropDelegate {
-    func tableView(_ tableView: UITableView, canHandle session: UIDropSession) -> Bool {
-        return session.hasItemsConforming(toTypeIdentifiers: [UTType.item.identifier])
-    }
-    
-    func tableView(_ tableView: UITableView, dropSessionDidUpdate session: UIDropSession, withDestinationIndexPath destinationIndexPath: IndexPath?) -> UITableViewDropProposal {
-        if session.localDragSession != nil {
-            return UITableViewDropProposal(operation: .move, intent: .insertAtDestinationIndexPath)
-        }
-        return UITableViewDropProposal(operation: .copy, intent: .insertAtDestinationIndexPath)
-    }
-    
-    func tableView(_ tableView: UITableView, performDropWith coordinator: UITableViewDropCoordinator) {
-        let destinationIndexPath: IndexPath
-        
-        if let indexPath = coordinator.destinationIndexPath {
-            destinationIndexPath = indexPath
-        } else {
-            let section = tableView.numberOfSections - 1
-            let row = tableView.numberOfRows(inSection: section)
-            destinationIndexPath = IndexPath(row: row, section: section)
-        }
-        
-        switch coordinator.proposal.operation {
-        case .move:
-            guard let item = coordinator.items.first,
-                  let sourceIndexPath = item.sourceIndexPath,
-                  let sourceFileName = item.dragItem.localObject as? String else {
+        // Create directory if it doesn't exist
+        if !fileManager.fileExists(atPath: extractionDirectory.path) {
+            do {
+                try fileManager.createDirectory(at: extractionDirectory, withIntermediateDirectories: true, attributes: nil)
+            } catch {
+                utilities.handleError(in: self, error: error, withTitle: NSLocalizedString("Failed to Create Directory", comment: "Error title"))
                 return
             }
+        }
+        
+        // Show progress
+        progressView.isHidden = false
+        progressView.progress = 0
+        
+        // Extract in background
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
             
-            // Handle reordering
-            self.reorderItems(coordinator: coordinator, destinationIndexPath: destinationIndexPath, sourceIndexPath: sourceIndexPath)
-            
-        case .copy:
-            // Handle items from outside the app
-            for item in coordinator.items {
-                item.dragItem.itemProvider.loadItem(forTypeIdentifier: UTType.item.identifier, options: nil) { (data, error) in
-                    guard let url = data as? URL else { return }
-                    
+            do {
+                try self.fileManager.unzipItem(at: fileURL, to: extractionDirectory, progress: { [weak self] progress in
                     DispatchQueue.main.async {
-                        self.handleImportedFile(url: url)
+                        self?.progressView.progress = Float(progress)
                     }
+                })
+                
+                // Parse IPA info
+                self.parseIPAInfo(in: extractionDirectory)
+                
+                DispatchQueue.main.async {
+                    self.progressView.isHidden = true
+                    self.loadFiles()
+                    self.utilities.showAlert(in: self, title: NSLocalizedString("Success", comment: "Success title"), message: NSLocalizedString("IPA extracted successfully", comment: "Extraction success message"))
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.progressView.isHidden = true
+                    self.utilities.handleError(in: self, error: error, withTitle: NSLocalizedString("Extraction Failed", comment: "Error title"))
                 }
             }
-            
-        default:
-            return
         }
     }
     
-    private func reorderItems(coordinator: UITableViewDropCoordinator, destinationIndexPath: IndexPath, sourceIndexPath: IndexPath) {
-        guard let item = coordinator.items.first,
-              let sourceFileName = item.dragItem.localObject as? String else {
-            return
-        }
+    private func parseIPAInfo(in directory: URL) {
+        // Find the Payload directory
+        let payloadURL = directory.appendingPathComponent("Payload")
         
-        fileListTableView.performBatchUpdates({
-            if searchController.isActive {
-                let sourceItem = filteredFileList[sourceIndexPath.row]
-                filteredFileList.remove(at: sourceIndexPath.row)
-                filteredFileList.insert(sourceItem, at: destinationIndexPath.row)
-                
-                // Also update the main fileList
-                if let sourceIndex = fileList.firstIndex(of: sourceItem),
-                   let destIndex = fileList.firstIndex(of: filteredFileList[destinationIndexPath.row]) {
-                    fileList.remove(at: sourceIndex)
-                    fileList.insert(sourceItem, at: destIndex)
-                }
-            } else {
-                let sourceItem = fileList[sourceIndexPath.row]
-                fileList.remove(at: sourceIndexPath.row)
-                fileList.insert(sourceItem, at: destinationIndexPath.row)
-            }
+        do {
+            let appFolders = try fileManager.contentsOfDirectory(at: payloadURL, includingPropertiesForKeys: nil)
             
-            fileListTableView.deleteRows(at: [sourceIndexPath], with: .automatic)
-            fileListTableView.insertRows(at: [destinationIndexPath], with: .automatic)
+            for appFolder in appFolders where appFolder.pathExtension == "app" {
+                let infoPlistURL = appFolder.appendingPathComponent("Info.plist")
+                
+                if fileManager.fileExists(atPath: infoPlistURL.path) {
+                    guard let infoPlist = NSDictionary(contentsOf: infoPlistURL) else { continue }
+                    
+                    // Extract app info
+                    let bundleID = infoPlist["CFBundleIdentifier"] as? String ?? "Unknown"
+                    let appName = infoPlist["CFBundleDisplayName"] as? String ?? infoPlist["CFBundleName"] as? String ?? "Unknown"
+                    let version = infoPlist["CFBundleShortVersionString"] as? String ?? "Unknown"
+                    let build = infoPlist["CFBundleVersion"] as? String ?? "Unknown"
+                    
+                    // Save to CoreData
+                    DispatchQueue.main.async {
+                        self.coreDataManager.saveAppInfo(
+                            bundleID: bundleID,
+                            name: appName,
+                            version: version,
+                            build: build,
+                            extractedPath: directory.path
+                        )
+                    }
+                    
+                    break
+                }
+            }
+        } catch {
+            print("Error parsing IPA info: \(error)")
+        }
+    }
+    
+    private func showIPAInfo(for fileURL: URL) {
+        let ipaInfoVC = IPAInfoViewController(ipaURL: fileURL)
+        let navController = UINavigationController(rootViewController: ipaInfoVC)
+        present(navController, animated: true)
+    }
+    // MARK: - UI Actions
+    
+    @objc private func showMenu() {
+        let actionSheet = UIAlertController(title: nil, message: nil, preferredStyle: .actionSheet)
+        
+        // Sort options
+        actionSheet.addAction(UIAlertAction(title: NSLocalizedString("Sort by Name", comment: "Sort option"), style: .default) { [weak self] _ in
+            self?.sortOrder = .name
+            self?.sortFiles()
+            self?.fileListTableView.reloadData()
         })
         
-        coordinator.drop(item.dragItem, toRowAt: destinationIndexPath)
+        actionSheet.addAction(UIAlertAction(title: NSLocalizedString("Sort by Date", comment: "Sort option"), style: .default) { [weak self] _ in
+            self?.sortOrder = .date
+            self?.sortFiles()
+            self?.fileListTableView.reloadData()
+        })
+        
+        actionSheet.addAction(UIAlertAction(title: NSLocalizedString("Sort by Size", comment: "Sort option"), style: .default) { [weak self] _ in
+            self?.sortOrder = .size
+            self?.sortFiles()
+            self?.fileListTableView.reloadData()
+        })
+        
+        // Download app option
+        actionSheet.addAction(UIAlertAction(title: NSLocalizedString("Download App", comment: "Download option"), style: .default) { [weak self] _ in
+            self?.showDownloadAppPrompt()
+        })
+        
+        // Create new file option
+        actionSheet.addAction(UIAlertAction(title: NSLocalizedString("Create New File", comment: "Create file option"), style: .default) { [weak self] _ in
+            self?.createNewFile()
+        })
+        
+        actionSheet.addAction(UIAlertAction(title: NSLocalizedString("Cancel", comment: "Cancel button"), style: .cancel))
+        
+        // For iPad
+        if let popoverController = actionSheet.popoverPresentationController {
+            popoverController.barButtonItem = navigationItem.rightBarButtonItems?.first
+        }
+        
+        present(actionSheet, animated: true)
     }
-}
-
-// MARK: - UIDocumentPickerDelegate Extension
-extension HomeViewController: UIDocumentPickerDelegate {
-    func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-        for url in urls {
-            handleImportedFile(url: url)
+    
+    @objc private func importFile() {
+        let documentPicker = UIDocumentPickerViewController(forOpeningContentTypes: [.item])
+        documentPicker.allowsMultipleSelection = true
+        documentPicker.delegate = self
+        present(documentPicker, animated: true)
+    }
+    
+    @objc private func addDirectory() {
+        let alert = UIAlertController(
+            title: NSLocalizedString("New Folder", comment: "New folder title"),
+            message: NSLocalizedString("Enter a name for the new folder", comment: "New folder message"),
+            preferredStyle: .alert
+        )
+        
+        alert.addTextField { textField in
+            textField.placeholder = NSLocalizedString("Folder Name", comment: "Folder name placeholder")
+        }
+        
+        alert.addAction(UIAlertAction(title: NSLocalizedString("Cancel", comment: "Cancel button"), style: .cancel))
+        
+        alert.addAction(UIAlertAction(title: NSLocalizedString("Create", comment: "Create button"), style: .default) { [weak self, weak alert] _ in
+            guard let self = self, let folderName = alert?.textFields?.first?.text, !folderName.isEmpty else { return }
+            
+            let newFolderURL = self.currentDirectoryPath.appendingPathComponent(folderName)
+            
+            do {
+                try self.fileManager.createDirectory(at: newFolderURL, withIntermediateDirectories: false, attributes: nil)
+                self.loadFiles()
+            } catch {
+                self.utilities.handleError(in: self, error: error, withTitle: NSLocalizedString("Failed to Create Folder", comment: "Error title"))
+            }
+        })
+        
+        present(alert, animated: true)
+    }
+    
+    @objc private func navigateToParentDirectory() {
+        guard currentDirectoryPath != documentsDirectory else { return }
+        
+        let parentDirectory = currentDirectoryPath.deletingLastPathComponent()
+        navigationController?.popViewController(animated: true)
+    }
+    
+    @objc private func refreshData() {
+        loadFiles()
+    }
+    
+    @objc private func toggleMultiSelectMode() {
+        isMultiSelectMode = true
+        fileListTableView.allowsMultipleSelection = true
+        selectedFiles.removeAll()
+        
+        // Update navigation items
+        navigationItem.leftBarButtonItem = cancelButton
+        navigationItem.rightBarButtonItems = [actionButton]
+        
+        // Update title
+        title = NSLocalizedString("Select Items", comment: "Multi-select mode title")
+        
+        // Reload to show checkmarks
+        fileListTableView.reloadData()
+    }
+    
+    @objc private func cancelMultiSelect() {
+        isMultiSelectMode = false
+        fileListTableView.allowsMultipleSelection = false
+        selectedFiles.removeAll()
+        
+        // Restore navigation items
+        setupUI()
+        
+        // Reload to hide checkmarks
+        fileListTableView.reloadData()
+    }
+    
+    @objc private func performBatchAction() {
+        guard !selectedFiles.isEmpty else { return }
+        
+        let actionSheet = UIAlertController(title: nil, message: nil, preferredStyle: .actionSheet)
+        
+        actionSheet.addAction(UIAlertAction(title: NSLocalizedString("Delete Selected", comment: "Delete action"), style: .destructive) { [weak self] _ in
+            self?.deleteSelectedFiles()
+        })
+        
+        actionSheet.addAction(UIAlertAction(title: NSLocalizedString("Move Selected", comment: "Move action"), style: .default) { [weak self] _ in
+            self?.moveSelectedFiles()
+        })
+        
+        actionSheet.addAction(UIAlertAction(title: NSLocalizedString("Share Selected", comment: "Share action"), style: .default) { [weak self] _ in
+            self?.shareSelectedFiles()
+        })
+        
+        actionSheet.addAction(UIAlertAction(title: NSLocalizedString("Cancel", comment: "Cancel button"), style: .cancel))
+        
+        // For iPad
+        if let popoverController = actionSheet.popoverPresentationController {
+            popoverController.barButtonItem = actionButton
+        }
+        
+        present(actionSheet, animated: true)
+    }
+    
+    private func deleteSelectedFiles() {
+        let alert = UIAlertController(
+            title: NSLocalizedString("Confirm Deletion", comment: "Confirm deletion title"),
+            message: NSLocalizedString("Are you sure you want to delete the selected items? This cannot be undone.", comment: "Confirm deletion message"),
+            preferredStyle: .alert
+        )
+        
+        alert.addAction(UIAlertAction(title: NSLocalizedString("Cancel", comment: "Cancel button"), style: .cancel))
+        
+        alert.addAction(UIAlertAction(title: NSLocalizedString("Delete", comment: "Delete button"), style: .destructive) { [weak self] _ in
+            guard let self = self else { return }
+            
+            var failedDeletions = 0
+            
+            for fileName in self.selectedFiles {
+                let fileURL = self.currentDirectoryPath.appendingPathComponent(fileName)
+                
+                do {
+                    try self.fileManager.removeItem(at: fileURL)
+                } catch {
+                    failedDeletions += 1
+                    print("Failed to delete \(fileName): \(error)")
+                }
+            }
+            
+            if failedDeletions > 0 {
+                self.utilities.showAlert(in: self, title: NSLocalizedString("Deletion Incomplete", comment: "Deletion incomplete title"), message: String(format: NSLocalizedString("Failed to delete %d items", comment: "Deletion incomplete message"), failedDeletions))
+            }
+            
+            self.cancelMultiSelect()
+            self.loadFiles()
+        })
+        
+        present(alert, animated: true)
+    }
+    
+    private func moveSelectedFiles() {
+        let folderPicker = FolderPickerViewController(rootDirectory: documentsDirectory, currentDirectory: currentDirectoryPath)
+        folderPicker.delegate = self
+        let navController = UINavigationController(rootViewController: folderPicker)
+        present(navController, animated: true)
+    }
+    
+    private func shareSelectedFiles() {
+        let fileURLs = selectedFiles.map { currentDirectoryPath.appendingPathComponent($0) }
+        
+        let activityVC = UIActivityViewController(activityItems: fileURLs, applicationActivities: nil)
+        
+        // For iPad
+        if let popoverController = activityVC.popoverPresentationController {
+            popoverController.barButtonItem = actionButton
+        }
+        
+        present(activityVC, animated: true)
+    }
+    
+    private func createNewFile() {
+        let alert = UIAlertController(
+            title: NSLocalizedString("New File", comment: "New file title"),
+            message: NSLocalizedString("Enter a name for the new file", comment: "New file message"),
+            preferredStyle: .alert
+        )
+        
+        alert.addTextField { textField in
+            textField.placeholder = NSLocalizedString("File Name", comment: "File name placeholder")
+        }
+        
+        alert.addAction(UIAlertAction(title: NSLocalizedString("Cancel", comment: "Cancel button"), style: .cancel))
+        
+        alert.addAction(UIAlertAction(title: NSLocalizedString("Create", comment: "Create button"), style: .default) { [weak self, weak alert] _ in
+            guard let self = self, let fileName = alert?.textFields?.first?.text, !fileName.isEmpty else { return }
+            
+            let newFileURL = self.currentDirectoryPath.appendingPathComponent(fileName)
+            
+            do {
+                try "".write(to: newFileURL, atomically: true, encoding: .utf8)
+                self.loadFiles()
+                
+                // Open the new file for editing
+                self.openTextFile(at: newFileURL)
+            } catch {
+                self.utilities.handleError(in: self, error: error, withTitle: NSLocalizedString("Failed to Create File", comment: "Error title"))
+            }
+        })
+        
+        present(alert, animated: true)
+    }
+    // MARK: - App Download
+    
+    private func showDownloadAppPrompt() {
+        let alert = UIAlertController(
+            title: NSLocalizedString("Download App", comment: "Download app title"),
+            message: NSLocalizedString("Enter the App Store ID or URL of the app you want to download", comment: "Download app message"),
+            preferredStyle: .alert
+        )
+        
+        alert.addTextField { textField in
+            textField.placeholder = NSLocalizedString("App ID or URL", comment: "App ID placeholder")
+            textField.keyboardType = .URL
+            textField.autocorrectionType = .no
+            textField.autocapitalizationType = .none
+        }
+        
+        alert.addAction(UIAlertAction(title: NSLocalizedString("Cancel", comment: "Cancel button"), style: .cancel))
+        
+        alert.addAction(UIAlertAction(title: NSLocalizedString("Download", comment: "Download button"), style: .default) { [weak self, weak alert] _ in
+            guard let self = self, let appIdentifier = alert?.textFields?.first?.text, !appIdentifier.isEmpty else { return }
+            
+            self.downloadApp(identifier: appIdentifier)
+        })
+        
+        present(alert, animated: true)
+    }
+    
+    private func downloadApp(identifier: String) {
+        // Extract app ID from URL if needed
+        var appID = identifier
+        
+        if appID.contains("id") {
+            if let idRange = appID.range(of: "id\\d+", options: .regularExpression) {
+                appID = String(appID[idRange].dropFirst(2))
+            }
+        }
+        
+        // Show progress
+        progressView.isHidden = false
+        progressView.progress = 0
+        
+        // Start background task
+        startBackgroundTask()
+        
+        // Initialize downloader
+        appDownloader = AppDownload()
+        appDownloader?.delegate = self
+        
+        // Start download
+        appDownloader?.downloadApp(withID: appID, to: currentDirectoryPath)
+    }
+    
+    private func startBackgroundTask() {
+        backgroundTaskID = UIApplication.shared.beginBackgroundTask { [weak self] in
+            self?.cancelBackgroundTask()
         }
     }
-}
-
-// MARK: - UIDocumentInteractionControllerDelegate Extension
-extension HomeViewController: UIDocumentInteractionControllerDelegate {
-    func documentInteractionControllerViewControllerForPreview(_ controller: UIDocumentInteractionController) -> UIViewController {
-        return self
-    }
-}
-
-// MARK: - FileHandlingDelegate Extension
-extension HomeViewController: FileHandlingDelegate {}
-
-// MARK: - File Model
-class File {
-    let url: URL
-    var name: String { return url.lastPathComponent }
-    var size: UInt64 {
-        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
-        return attributes?[.size] as? UInt64 ?? 0
-    }
-    var date: Date {
-        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
-        return attributes?[.modificationDate] as? Date ?? Date.distantPast
-    }
-    var isDirectory: Bool {
-        return FileManager.default.isDirectory(at: url)
+    
+    private func cancelBackgroundTask() {
+        if backgroundTaskID != .invalid {
+            UIApplication.shared.endBackgroundTask(backgroundTaskID)
+            backgroundTaskID = .invalid
+        }
     }
     
-    init(url: URL) {
-        self.url = url
+    @objc private func appDidEnterBackground() {
+        // If we're downloading, make sure background task is running
+        if appDownloader != nil && appDownloader?.isDownloading == true {
+            startBackgroundTask()
+        }
     }
     
-    var formattedSize: String {
+    @objc private func appWillEnterForeground() {
+        // Cancel background task if app is in foreground
+        cancelBackgroundTask()
+    }
+    
+    // MARK: - UI Helpers
+    
+    private func showEmptyState() {
+        let emptyLabel = UILabel()
+        emptyLabel.text = NSLocalizedString("No files found", comment: "Empty state message")
+        emptyLabel.textAlignment = .center
+        emptyLabel.textColor = .secondaryLabel
+        emptyLabel.font = UIFont.systemFont(ofSize: 18)
+        emptyLabel.translatesAutoresizingMaskIntoConstraints = false
+        
+        let emptyImageView = UIImageView(image: UIImage(systemName: "folder"))
+        emptyImageView.tintColor = .secondaryLabel
+        emptyImageView.contentMode = .scaleAspectFit
+        emptyImageView.translatesAutoresizingMaskIntoConstraints = false
+        
+        let stackView = UIStackView(arrangedSubviews: [emptyImageView, emptyLabel])
+        stackView.axis = .vertical
+        stackView.spacing = 16
+        stackView.alignment = .center
+        stackView.translatesAutoresizingMaskIntoConstraints = false
+        stackView.tag = 100 // Tag for identification
+        
+        // Remove existing empty state if any
+        if let existingStackView = view.viewWithTag(100) {
+            existingStackView.removeFromSuperview()
+        }
+        
+        view.addSubview(stackView)
+        
+        NSLayoutConstraint.activate([
+            emptyImageView.heightAnchor.constraint(equalToConstant: 80),
+            emptyImageView.widthAnchor.constraint(equalToConstant: 80),
+            
+            stackView.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            stackView.centerYAnchor.constraint(equalTo: view.centerYAnchor)
+        ])
+    }
+    
+    private func hideEmptyState() {
+        if let emptyStateView = view.viewWithTag(100) {
+            emptyStateView.removeFromSuperview()
+        }
+    }
+    
+    private func getFileAttributes(for fileName: String) -> (isDirectory: Bool, size: Int64, modificationDate: Date) {
+        let fileURL = currentDirectoryPath.appendingPathComponent(fileName)
+        var isDirectory: ObjCBool = false
+        
+        guard fileManager.fileExists(atPath: fileURL.path, isDirectory: &isDirectory) else {
+            return (false, 0, Date())
+        }
+        
+        do {
+            let attributes = try fileManager.attributesOfItem(atPath: fileURL.path)
+            let size = attributes[.size] as? Int64 ?? 0
+            let modificationDate = attributes[.modificationDate] as? Date ?? Date()
+            
+            return (isDirectory.boolValue, size, modificationDate)
+        } catch {
+            print("Error getting file attributes: \(error)")
+            return (isDirectory.boolValue, 0, Date())
+        }
+    }
+    
+    private func formatFileSize(_ size: Int64) -> String {
         let formatter = ByteCountFormatter()
-        formatter.allowedUnits = [.useKB, .useMB, .useGB]
+        formatter.allowedUnits = [.useAll]
         formatter.countStyle = .file
-        return formatter.string(fromByteCount: Int64(size))
+        return formatter.string(fromByteCount: size)
     }
     
-    var formattedDate: String {
+    private func formatDate(_ date: Date) -> String {
         let formatter = DateFormatter()
         formatter.dateStyle = .medium
         formatter.timeStyle = .short
         return formatter.string(from: date)
     }
     
-    var icon: UIImage {
+    private func getFileIcon(for fileName: String, isDirectory: Bool) -> UIImage? {
         if isDirectory {
-            return UIImage(systemName: "folder") ?? UIImage()
+            return UIImage(systemName: "folder")
         }
         
-        switch url.pathExtension.lowercased() {
+        let fileExtension = URL(fileURLWithPath: fileName).pathExtension.lowercased()
+        
+        switch fileExtension {
+        case "txt", "log":
+            return UIImage(systemName: "doc.text")
         case "pdf":
-            return UIImage(systemName: "doc.text") ?? UIImage()
-        case "jpg", "jpeg", "png", "gif", "heic":
-            return UIImage(systemName: "photo") ?? UIImage()
-        case "mp4", "mov", "avi":
-            return UIImage(systemName: "film") ?? UIImage()
-        case "mp3", "wav", "aac", "m4a":
-            return UIImage(systemName: "music.note") ?? UIImage()
+            return UIImage(systemName: "doc.text.viewfinder")
+        case "jpg", "jpeg", "png", "gif", "heic", "webp":
+            return UIImage(systemName: "photo")
+        case "mp4", "mov", "m4v":
+            return UIImage(systemName: "film")
+        case "mp3", "m4a", "wav":
+            return UIImage(systemName: "music.note")
         case "zip", "rar", "7z":
-            return UIImage(systemName: "archivebox") ?? UIImage()
-        case "plist", "xml":
-            return UIImage(systemName: "list.bullet") ?? UIImage()
-        case "txt", "rtf", "md":
-            return UIImage(systemName: "doc.text") ?? UIImage()
+            return UIImage(systemName: "archivebox")
+        case "ipa":
+            return UIImage(systemName: "app.badge")
+        case "plist", "xml", "json":
+            return UIImage(systemName: "doc.plaintext")
         case "html", "css", "js":
-            return UIImage(systemName: "doc.text.code") ?? UIImage()
+            return UIImage(systemName: "doc.richtext")
+        case "swift", "m", "h", "c", "cpp":
+            return UIImage(systemName: "chevron.left.forwardslash.chevron.right")
         default:
-            return UIImage(systemName: "doc") ?? UIImage()
+            return UIImage(systemName: "doc")
         }
     }
+    // MARK: - UITableViewDataSource
+    
+    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+        let count = searchController.isActive ? filteredFileList.count : fileList.count
+        return count
+    }
+    
+    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        let fileList = searchController.isActive ? filteredFileList : self.fileList
+        guard indexPath.row < fileList.count else { return UITableViewCell() }
+        
+        let fileName = fileList[indexPath.row]
+        let fileURL = currentDirectoryPath.appendingPathComponent(fileName)
+        let (isDirectory, size, modificationDate) = getFileAttributes(for: fileName)
+        
+        // Check if it's an IPA file
+        if fileName.lowercased().hasSuffix(".ipa") {
+            let cell = tableView.dequeueReusableCell(withIdentifier: "AppCell", for: indexPath) as! AppTableViewCell
+            
+            // Configure cell
+            cell.configure(
+                name: fileName.deletingPathExtension,
+                fileSize: formatFileSize(size),
+                modificationDate: formatDate(modificationDate),
+                iconImage: getFileIcon(for: fileName, isDirectory: isDirectory)
+            )
+            
+            // Check if we have app info in CoreData
+            if let appInfo = coreDataManager.getAppInfo(forFileName: fileName) {
+                cell.updateAppInfo(
+                    name: appInfo.name ?? fileName.deletingPathExtension,
+                    bundleID: appInfo.bundleID ?? "Unknown",
+                    version: appInfo.version ?? "Unknown"
+                )
+            }
+            
+            // Set selection style
+            cell.selectionStyle = .default
+            
+            // Set checkmark if in multi-select mode and selected
+            if isMultiSelectMode {
+                cell.accessoryType = selectedFiles.contains(fileName) ? .checkmark : .none
+            } else {
+                cell.accessoryType = .none
+            }
+            
+            return cell
+        } else {
+            let cell = tableView.dequeueReusableCell(withIdentifier: "FileCell", for: indexPath) as! FileTableViewCell
+            
+            // Configure cell
+            cell.configure(
+                name: fileName,
+                isDirectory: isDirectory,
+                fileSize: formatFileSize(size),
+                modificationDate: formatDate(modificationDate),
+                iconImage: getFileIcon(for: fileName, isDirectory: isDirectory)
+            )
+            
+            // Set selection style
+            cell.selectionStyle = .default
+            
+            // Set checkmark if in multi-select mode and selected
+            if isMultiSelectMode {
+                cell.accessoryType = selectedFiles.contains(fileName) ? .checkmark : .none
+            } else {
+                cell.accessoryType = isDirectory ? .disclosureIndicator : .none
+            }
+            
+            return cell
+        }
+    }
+    
+    // MARK: - UITableViewDelegate
+    
+    func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+        let fileList = searchController.isActive ? filteredFileList : self.fileList
+        guard indexPath.row < fileList.count else { return }
+        
+        let fileName = fileList[indexPath.row]
+        
+        if isMultiSelectMode {
+            if selectedFiles.contains(fileName) {
+                if let index = selectedFiles.firstIndex(of: fileName) {
+                    selectedFiles.remove(at: index)
+                }
+                tableView.cellForRow(at: indexPath)?.accessoryType = .none
+            } else {
+                selectedFiles.append(fileName)
+                tableView.cellForRow(at: indexPath)?.accessoryType = .checkmark
+            }
+            
+            // Enable/disable action button based on selection
+            actionButton.isEnabled = !selectedFiles.isEmpty
+            
+            // Update title with count
+            title = selectedFiles.isEmpty ? 
+                NSLocalizedString("Select Items", comment: "Multi-select mode title") : 
+                String(format: NSLocalizedString("%d Selected", comment: "Selected items count"), selectedFiles.count)
+        } else {
+            tableView.deselectRow(at: indexPath, animated: true)
+            openFile(at: indexPath)
+        }
+    }
+    
+    func tableView(_ tableView: UITableView, trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath) -> UISwipeActionsConfiguration? {
+        let fileList = searchController.isActive ? filteredFileList : self.fileList
+        guard indexPath.row < fileList.count else { return nil }
+        
+        let fileName = fileList[indexPath.row]
+        let fileURL = currentDirectoryPath.appendingPathComponent(fileName)
+        
+        // Delete action
+        let deleteAction = UIContextualAction(style: .destructive, title: NSLocalizedString("Delete", comment: "Delete action")) { [weak self] (action, view, completionHandler) in
+            guard let self = self else { return completionHandler(false) }
+            
+            let alert = UIAlertController(
+                title: NSLocalizedString("Confirm Deletion", comment: "Confirm deletion title"),
+                message: String(format: NSLocalizedString("Are you sure you want to delete '%@'?", comment: "Confirm deletion message"), fileName),
+                preferredStyle: .alert
+            )
+            
+            alert.addAction(UIAlertAction(title: NSLocalizedString("Cancel", comment: "Cancel button"), style: .cancel) { _ in
+                completionHandler(false)
+            })
+            
+            alert.addAction(UIAlertAction(title: NSLocalizedString("Delete", comment: "Delete button"), style: .destructive) { _ in
+                do {
+                    try self.fileManager.removeItem(at: fileURL)
+                    self.loadFiles()
+                    completionHandler(true)
+                } catch {
+                    self.utilities.handleError(in: self, error: error, withTitle: NSLocalizedString("Deletion Failed", comment: "Error title"))
+                    completionHandler(false)
+                }
+            })
+            
+            self.present(alert, animated: true)
+        }
+        
+        // Rename action
+        let renameAction = UIContextualAction(style: .normal, title: NSLocalizedString("Rename", comment: "Rename action")) { [weak self] (action, view, completionHandler) in
+            guard let self = self else { return completionHandler(false) }
+            
+            let alert = UIAlertController(
+                title: NSLocalizedString("Rename File", comment: "Rename title"),
+                message: NSLocalizedString("Enter a new name", comment: "Rename message"),
+                preferredStyle: .alert
+            )
+            
+            alert.addTextField { textField in
+                textField.text = fileName
+            }
+            
+            alert.addAction(UIAlertAction(title: NSLocalizedString("Cancel", comment: "Cancel button"), style: .cancel) { _ in
+                completionHandler(false)
+            })
+            
+            alert.addAction(UIAlertAction(title: NSLocalizedString("Rename", comment: "Rename button"), style: .default) { _ in
+                guard let newName = alert.textFields?.first?.text, !newName.isEmpty, newName != fileName else {
+                    completionHandler(false)
+                    return
+                }
+                
+                let newFileURL = self.currentDirectoryPath.appendingPathComponent(newName)
+                
+                do {
+                    try self.fileManager.moveItem(at: fileURL, to: newFileURL)
+                    self.loadFiles()
+                    completionHandler(true)
+                } catch {
+                    self.utilities.handleError(in: self, error: error, withTitle: NSLocalizedString("Rename Failed", comment: "Error title"))
+                    completionHandler(false)
+                }
+            })
+            
+            self.present(alert, animated: true)
+        }
+        
+        // Share action
+        let shareAction = UIContextualAction(style: .normal, title: NSLocalizedString("Share", comment: "Share action")) { [weak self] (action, view, completionHandler) in
+            guard let self = self else { return completionHandler(false) }
+            
+            let activityVC = UIActivityViewController(activityItems: [fileURL], applicationActivities: nil)
+            
+            // For iPad
+            if let popoverController = activityVC.popoverPresentationController {
+                popoverController.sourceView = tableView.cellForRow(at: indexPath)
+                popoverController.sourceRect = tableView.cellForRow(at: indexPath)?.bounds ?? .zero
+            }
+            
+            self.present(activityVC, animated: true)
+            completionHandler(true)
+        }
+        
+        // Customize action colors
+        renameAction.backgroundColor = .systemBlue
+        shareAction.backgroundColor = .systemGreen
+        
+        return UISwipeActionsConfiguration(actions: [deleteAction, renameAction, shareAction])
+    }
+    
+    // MARK: - UITableViewDragDelegate
+    
+    func tableView(_ tableView: UITableView, itemsForBeginning session: UIDragSession, at indexPath: IndexPath) -> [UIDragItem] {
+        let fileList = searchController.isActive ? filteredFileList : self.fileList
+        guard indexPath.row < fileList.count else { return [] }
+        
+        let fileName = fileList[indexPath.row]
+        let fileURL = currentDirectoryPath.appendingPathComponent(fileName)
+        
+        let itemProvider = NSItemProvider(object: fileURL as NSURL)
+        let dragItem = UIDragItem(itemProvider: itemProvider)
+        dragItem.localObject = fileName
+        
+        return [dragItem]
+    }
+    
+    // MARK: - UITableViewDropDelegate
+    
+    func tableView(_ tableView: UITableView, performDropWith coordinator: UITableViewDropCoordinator) {
+        guard let destinationIndexPath = coordinator.destinationIndexPath else { return }
+        
+        for item in coordinator.items {
+            guard let sourceIndexPath = item.sourceIndexPath else { continue }
+            
+            // Only allow reordering if not searching and not in a subdirectory
+            if searchController.isActive || currentDirectoryPath != documentsDirectory {
+                return
+            }
+            
+            // Update data source
+            let movedItem = fileList.remove(at: sourceIndexPath.row)
+            fileList.insert(movedItem, at: destinationIndexPath.row)
+            
+            // Update UI
+            tableView.moveRow(at: sourceIndexPath, to: destinationIndexPath)
+        }
+    }
+    
+    func tableView(_ tableView: UITableView, dropSessionDidUpdate session: UIDropSession, withDestinationIndexPath destinationIndexPath: IndexPath?) -> UITableViewDropProposal {
+        // Only allow reordering if not searching and not in a subdirectory
+        if searchController.isActive || currentDirectoryPath != documentsDirectory {
+            return UITableViewDropProposal(operation: .forbidden)
+        }
+        
+        if session.localDragSession != nil {
+            return UITableViewDropProposal(operation: .move, intent: .insertAtDestinationIndexPath)
+        }
+        
+        return UITableViewDropProposal(operation: .copy, intent: .insertAtDestinationIndexPath)
+    }
+    // MARK: - UISearchResultsUpdating
+    
+    func updateSearchResults(for searchController: UISearchController) {
+        guard let searchText = searchController.searchBar.text else { return }
+        filterContentForSearchText(searchText)
+    }
+    
+    private func filterContentForSearchText(_ searchText: String) {
+        if searchText.isEmpty {
+            filteredFileList = fileList
+        } else {
+            filteredFileList = fileList.filter { fileName in
+                return fileName.localizedCaseInsensitiveContains(searchText)
+            }
+        }
+        
+        fileListTableView.reloadData()
+    }
+    
+    // MARK: - UIDocumentPickerDelegate
+    
+    func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+        activityIndicator.startAnimating()
+        
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            
+            var importErrors = 0
+            
+            for url in urls {
+                let fileName = url.lastPathComponent
+                let destinationURL = self.currentDirectoryPath.appendingPathComponent(fileName)
+                
+                // Check if file already exists
+                if self.fileManager.fileExists(atPath: destinationURL.path) {
+                    // Generate unique name
+                    let fileNameWithoutExtension = url.deletingPathExtension().lastPathComponent
+                    let fileExtension = url.pathExtension
+                    let newFileName = "\(fileNameWithoutExtension)_\(Int(Date().timeIntervalSince1970)).\(fileExtension)"
+                    let newDestinationURL = self.currentDirectoryPath.appendingPathComponent(newFileName)
+                    
+                    do {
+                        try self.fileManager.copyItem(at: url, to: newDestinationURL)
+                    } catch {
+                        importErrors += 1
+                        print("Error importing file: \(error)")
+                    }
+                } else {
+                    do {
+                        try self.fileManager.copyItem(at: url, to: destinationURL)
+                    } catch {
+                        importErrors += 1
+                        print("Error importing file: \(error)")
+                    }
+                }
+            }
+            
+            DispatchQueue.main.async {
+                self.activityIndicator.stopAnimating()
+                self.loadFiles()
+                
+                if importErrors > 0 {
+                    self.utilities.showAlert(in: self, title: NSLocalizedString("Import Incomplete", comment: "Import incomplete title"), message: String(format: NSLocalizedString("Failed to import %d files", comment: "Import incomplete message"), importErrors))
+                }
+            }
+        }
+    }
+    
+    // MARK: - UIDocumentInteractionControllerDelegate
+    
+    func documentInteractionControllerViewControllerForPreview(_ controller: UIDocumentInteractionController) -> UIViewController {
+        return self
+    }
+    
+    func documentInteractionControllerDidEndPreview(_ controller: UIDocumentInteractionController) {
+        // Refresh file list in case file was modified
+        loadFiles()
+    }
+    
+    // MARK: - FolderPickerDelegate
+    
+    func folderPicker(_ folderPicker: FolderPickerViewController, didSelectFolder folderURL: URL) {
+        guard !selectedFiles.isEmpty else { return }
+        
+        var moveErrors = 0
+        
+        for fileName in selectedFiles {
+            let sourceURL = currentDirectoryPath.appendingPathComponent(fileName)
+            let destinationURL = folderURL.appendingPathComponent(fileName)
+            
+            // Check if file already exists at destination
+            if fileManager.fileExists(atPath: destinationURL.path) {
+                // Generate unique name
+                let fileNameWithoutExtension = URL(fileURLWithPath: fileName).deletingPathExtension().lastPathComponent
+                let fileExtension = URL(fileURLWithPath: fileName).pathExtension
+                let newFileName = "\(fileNameWithoutExtension)_\(Int(Date().timeIntervalSince1970)).\(fileExtension)"
+                let newDestinationURL = folderURL.appendingPathComponent(newFileName)
+                
+                do {
+                    try fileManager.moveItem(at: sourceURL, to: newDestinationURL)
+                } catch {
+                    moveErrors += 1
+                    print("Error moving file: \(error)")
+                }
+            } else {
+                do {
+                    try fileManager.moveItem(at: sourceURL, to: destinationURL)
+                } catch {
+                    moveErrors += 1
+                    print("Error moving file: \(error)")
+                }
+            }
+        }
+        
+        // Exit multi-select mode
+        cancelMultiSelect()
+        
+        // Refresh file list
+        loadFiles()
+        
+        if moveErrors > 0 {
+            utilities.showAlert(in: self, title: NSLocalizedString("Move Incomplete", comment: "Move incomplete title"), message: String(format: NSLocalizedString("Failed to move %d files", comment: "Move incomplete message"), moveErrors))
+        }
+    }
+    
+    // MARK: - DownloadDelegate
+    
+    func downloadProgress(progress: Float) {
+        DispatchQueue.main.async { [weak self] in
+            self?.progressView.progress = progress
+            self?.downloadProgress = progress
+        }
+    }
+    
+    func downloadDidFinish(fileURL: URL) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            
+            self.progressView.progress = 1.0
+            self.downloadProgress = 1.0
+            
+            // If it's an IPA file, extract it
+            if fileURL.pathExtension.lowercased() == "ipa" {
+                self.extractIPA(at: fileURL)
+            } else {
+                self.progressView.isHidden = true
+                self.loadFiles()
+                self.utilities.showAlert(in: self, title: NSLocalizedString("Download Complete", comment: "Download complete title"), message: NSLocalizedString("File downloaded successfully", comment: "Download complete message"))
+            }
+            
+            // End background task
+            self.cancelBackgroundTask()
+            self.appDownloader = nil
+        }
+    }
+    
+    func downloadDidFail(with error: Error) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            
+            self.progressView.isHidden = true
+            self.utilities.handleError(in: self, error: error, withTitle: NSLocalizedString("Download Failed", comment: "Download failed title"))
+            
+            // End background task
+            self.cancelBackgroundTask()
+            self.appDownloader = nil
+        }
+    }
+    
+    func extractionProgress(progress: Float) {
+        DispatchQueue.main.async { [weak self] in
+            self?.progressView.progress = progress
+            self?.extractionProgress = progress
+        }
+    }
+    
+    func extractionDidFinish(directoryURL: URL) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            
+            self.progressView.isHidden = true
+            self.loadFiles()
+            self.utilities.showAlert(in: self, title: NSLocalizedString("Extraction Complete", comment: "Extraction complete title"), message: NSLocalizedString("App extracted successfully", comment: "Extraction complete message"))
+        }
+    }
+    
+    func extractionDidFail(with error: Error) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            
+            self.progressView.isHidden = true
+            self.utilities.handleError(in: self, error: error, withTitle: NSLocalizedString("Extraction Failed", comment: "Extraction failed title"))
+        }
+    }
+    
+    // MARK: - TextEditorDelegate
+    
+    func textEditorDidSave(_ editor: TextEditorViewController) {
+        loadFiles()
+    }
 }
+
+// MARK: - UITableView Extensions
+
+extension HomeViewController: UITableViewDelegate, UITableViewDataSource, UITableViewDragDelegate, UITableViewDropDelegate {}
+
+// MARK: - UISearchResultsUpdating Extension
+
+extension HomeViewController: UISearchResultsUpdating {}
+
+// MARK: - UIDocumentPickerDelegate Extension
+
+extension HomeViewController: UIDocumentPickerDelegate {}
+
+// MARK: - UIDocumentInteractionControllerDelegate Extension
+
+extension HomeViewController: UIDocumentInteractionControllerDelegate {}
+
+// MARK: - FolderPickerDelegate Extension
+
+extension HomeViewController: FolderPickerDelegate {}
+
+// MARK: - TextEditorDelegate Extension
+
+extension HomeViewController: TextEditorDelegate {}
+
+// MARK: - FileHandlingDelegate Extension
+
+extension HomeViewController: FileHandlingDelegate {}
 // MARK: - FileTableViewCell
+
 class FileTableViewCell: UITableViewCell {
-    // UI Components
-    private let fileIconImageView = UIImageView()
-    private let fileNameLabel = UILabel()
-    private let fileSizeLabel = UILabel()
-    private let fileDateLabel = UILabel()
-    private let accessoryIconView = UIImageView()
+    
+    // MARK: - UI Components
+    
+    private let fileIconImageView: UIImageView = {
+        let imageView = UIImageView()
+        imageView.contentMode = .scaleAspectFit
+        imageView.tintColor = .systemBlue
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        return imageView
+    }()
+    
+    private let fileNameLabel: UILabel = {
+        let label = UILabel()
+        label.font = UIFont.systemFont(ofSize: 16, weight: .medium)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        return label
+    }()
+    
+    private let fileSizeLabel: UILabel = {
+        let label = UILabel()
+        label.font = UIFont.systemFont(ofSize: 12)
+        label.textColor = .secondaryLabel
+        label.translatesAutoresizingMaskIntoConstraints = false
+        return label
+    }()
+    
+    private let dateLabel: UILabel = {
+        let label = UILabel()
+        label.font = UIFont.systemFont(ofSize: 12)
+        label.textColor = .secondaryLabel
+        label.translatesAutoresizingMaskIntoConstraints = false
+        return label
+    }()
+    
+    // MARK: - Initialization
     
     override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
         super.init(style: style, reuseIdentifier: reuseIdentifier)
@@ -685,40 +1605,17 @@ class FileTableViewCell: UITableViewCell {
     }
     
     required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
+        super.init(coder: coder)
+        setupUI()
     }
     
+    // MARK: - UI Setup
+    
     private func setupUI() {
-        // Configure icon
-        fileIconImageView.contentMode = .scaleAspectFit
-        fileIconImageView.tintColor = .systemBlue
         contentView.addSubview(fileIconImageView)
-        
-        // Configure labels
-        fileNameLabel.font = UIFont.systemFont(ofSize: 16, weight: .medium)
-        fileNameLabel.textColor = .label
         contentView.addSubview(fileNameLabel)
-        
-        fileSizeLabel.font = UIFont.systemFont(ofSize: 12)
-        fileSizeLabel.textColor = .secondaryLabel
         contentView.addSubview(fileSizeLabel)
-        
-        fileDateLabel.font = UIFont.systemFont(ofSize: 12)
-        fileDateLabel.textColor = .secondaryLabel
-        contentView.addSubview(fileDateLabel)
-        
-        // Configure accessory
-        accessoryIconView.image = UIImage(systemName: "chevron.right")
-        accessoryIconView.tintColor = .tertiaryLabel
-        accessoryIconView.contentMode = .scaleAspectFit
-        contentView.addSubview(accessoryIconView)
-        
-        // Set up constraints
-        fileIconImageView.translatesAutoresizingMaskIntoConstraints = false
-        fileNameLabel.translatesAutoresizingMaskIntoConstraints = false
-        fileSizeLabel.translatesAutoresizingMaskIntoConstraints = false
-        fileDateLabel.translatesAutoresizingMaskIntoConstraints = false
-        accessoryIconView.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(dateLabel)
         
         NSLayoutConstraint.activate([
             fileIconImageView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
@@ -727,37 +1624,31 @@ class FileTableViewCell: UITableViewCell {
             fileIconImageView.heightAnchor.constraint(equalToConstant: 40),
             
             fileNameLabel.leadingAnchor.constraint(equalTo: fileIconImageView.trailingAnchor, constant: 12),
+            fileNameLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16),
             fileNameLabel.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 12),
-            fileNameLabel.trailingAnchor.constraint(equalTo: accessoryIconView.leadingAnchor, constant: -8),
             
-            fileSizeLabel.leadingAnchor.constraint(equalTo: fileNameLabel.leadingAnchor),
+            fileSizeLabel.leadingAnchor.constraint(equalTo: fileIconImageView.trailingAnchor, constant: 12),
             fileSizeLabel.topAnchor.constraint(equalTo: fileNameLabel.bottomAnchor, constant: 4),
-            fileSizeLabel.bottomAnchor.constraint(lessThanOrEqualTo: contentView.bottomAnchor, constant: -12),
             
-            fileDateLabel.leadingAnchor.constraint(equalTo: fileSizeLabel.trailingAnchor, constant: 16),
-            fileDateLabel.centerYAnchor.constraint(equalTo: fileSizeLabel.centerYAnchor),
-            fileDateLabel.trailingAnchor.constraint(equalTo: fileNameLabel.trailingAnchor),
-            
-            accessoryIconView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16),
-            accessoryIconView.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
-            accessoryIconView.widthAnchor.constraint(equalToConstant: 12),
-            accessoryIconView.heightAnchor.constraint(equalToConstant: 20)
+            dateLabel.leadingAnchor.constraint(equalTo: fileSizeLabel.trailingAnchor, constant: 16),
+            dateLabel.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -16),
+            dateLabel.topAnchor.constraint(equalTo: fileNameLabel.bottomAnchor, constant: 4)
         ])
     }
     
-    func configure(with file: File) {
-        fileNameLabel.text = file.name
-        fileSizeLabel.text = file.formattedSize
-        fileDateLabel.text = file.formattedDate
-        fileIconImageView.image = file.icon
+    // MARK: - Configuration
+    
+    func configure(name: String, isDirectory: Bool, fileSize: String, modificationDate: String, iconImage: UIImage?) {
+        fileNameLabel.text = name
+        fileSizeLabel.text = fileSize
+        dateLabel.text = modificationDate
+        fileIconImageView.image = iconImage
         
-        // Add directory indicator
-        if file.isDirectory {
-            accessoryType = .disclosureIndicator
-            accessoryIconView.isHidden = true
+        // Make directory names bold
+        if isDirectory {
+            fileNameLabel.font = UIFont.systemFont(ofSize: 16, weight: .semibold)
         } else {
-            accessoryType = .none
-            accessoryIconView.isHidden = false
+            fileNameLabel.font = UIFont.systemFont(ofSize: 16, weight: .regular)
         }
     }
     
@@ -765,745 +1656,67 @@ class FileTableViewCell: UITableViewCell {
         super.prepareForReuse()
         fileNameLabel.text = nil
         fileSizeLabel.text = nil
-        fileDateLabel.text = nil
+        dateLabel.text = nil
         fileIconImageView.image = nil
+        accessoryType = .none
     }
 }
+// MARK: - AppTableViewCell
 
-// MARK: - HomeViewFileHandlers
-class HomeViewFileHandlers {
-    private let fileManager = FileManager.default
-    private let utilities = HomeViewUtilities()
+class AppTableViewCell: UITableViewCell {
     
-    func uploadFile(viewController: FileHandlingDelegate) {
-        let documentTypes: [UTType] = [.zip, .item, .content, .data, .text, .image]
-        let documentPicker = UIDocumentPickerViewController(forOpeningContentTypes: documentTypes)
-        documentPicker.delegate = viewController as? UIDocumentPickerDelegate
-        documentPicker.allowsMultipleSelection = true
-        viewController.present(documentPicker, animated: true, completion: nil)
-    }
+    // MARK: - UI Components
     
-    func createDirectory(at url: URL, withName name: String, completion: @escaping (Result<URL, Error>) -> Void) {
-        let directoryURL = url.appendingPathComponent(name)
-        
-        do {
-            try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: false, attributes: nil)
-            completion(.success(directoryURL))
-        } catch {
-            completion(.failure(error))
-        }
-    }
-    
-    func deleteItem(at url: URL, completion: @escaping (Result<Void, Error>) -> Void) {
-        do {
-            try fileManager.removeItem(at: url)
-            completion(.success(()))
-        } catch {
-            completion(.failure(error))
-        }
-    }
-    
-    func renameItem(at url: URL, to newName: String, completion: @escaping (Result<URL, Error>) -> Void) {
-        let newURL = url.deletingLastPathComponent().appendingPathComponent(newName)
-        
-        do {
-            try fileManager.moveItem(at: url, to: newURL)
-            completion(.success(newURL))
-        } catch {
-            completion(.failure(error))
-        }
-    }
-    
-    func copyItem(at sourceURL: URL, to destinationURL: URL, completion: @escaping (Result<URL, Error>) -> Void) {
-        do {
-            try fileManager.copyItem(at: sourceURL, to: destinationURL)
-            completion(.success(destinationURL))
-        } catch {
-            completion(.failure(error))
-        }
-    }
-    
-    func moveItem(at sourceURL: URL, to destinationURL: URL, completion: @escaping (Result<URL, Error>) -> Void) {
-        do {
-            try fileManager.moveItem(at: sourceURL, to: destinationURL)
-            completion(.success(destinationURL))
-        } catch {
-            completion(.failure(error))
-        }
-    }
-    
-    func unzipItem(at zipURL: URL, to destinationURL: URL, completion: @escaping (Result<URL, Error>) -> Void) {
-        do {
-            try fileManager.unzipItem(at: zipURL, to: destinationURL)
-            completion(.success(destinationURL))
-        } catch {
-            completion(.failure(error))
-        }
-    }
-}
-// MARK: - HomeViewUtilities
-class HomeViewUtilities {
-    func handleError(in viewController: UIViewController, error: Error, withTitle title: String) {
-        let alertController = UIAlertController(
-            title: title,
-            message: error.localizedDescription,
-            preferredStyle: .alert
-        )
-        alertController.addAction(UIAlertAction(title: "OK", style: .default))
-        viewController.present(alertController, animated: true)
-        
-        // Log the error
-        os_log("Error: %{public}@", log: OSLog.default, type: .error, error.localizedDescription)
-    }
-    
-    func showAlert(in viewController: UIViewController, title: String, message: String, actions: [UIAlertAction] = []) {
-        let alertController = UIAlertController(
-            title: title,
-            message: message,
-            preferredStyle: .alert
-        )
-        
-        if actions.isEmpty {
-            alertController.addAction(UIAlertAction(title: "OK", style: .default))
-        } else {
-            for action in actions {
-                alertController.addAction(action)
-            }
-        }
-        
-        viewController.present(alertController, animated: true)
-    }
-    
-    func showActionSheet(in viewController: UIViewController, title: String?, message: String?, actions: [UIAlertAction]) {
-        let alertController = UIAlertController(
-            title: title,
-            message: message,
-            preferredStyle: .actionSheet
-        )
-        
-        for action in actions {
-            alertController.addAction(action)
-        }
-        
-        alertController.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        
-        // For iPad support
-        if let popoverController = alertController.popoverPresentationController {
-            popoverController.sourceView = viewController.view
-            popoverController.sourceRect = CGRect(x: viewController.view.bounds.midX, y: viewController.view.bounds.midY, width: 0, height: 0)
-            popoverController.permittedArrowDirections = []
-        }
-        
-        viewController.present(alertController, animated: true)
-    }
-}
-
-// MARK: - FileManager Extensions
-extension FileManager {
-    func isDirectory(at url: URL) -> Bool {
-        var isDir: ObjCBool = false
-        let exists = fileExists(atPath: url.path, isDirectory: &isDir)
-        return exists && isDir.boolValue
-    }
-    
-    func fileSize(at path: String) -> UInt64? {
-        do {
-            let attributes = try attributesOfItem(atPath: path)
-            return attributes[.size] as? UInt64
-        } catch {
-            return nil
-        }
-    }
-    
-    func modificationDate(at path: String) -> Date? {
-        do {
-            let attributes = try attributesOfItem(atPath: path)
-            return attributes[.modificationDate] as? Date
-        } catch {
-            return nil
-        }
-    }
-    
-    func createDirectoryIfNeeded(at url: URL) throws {
-        if !fileExists(atPath: url.path) {
-            try createDirectory(at: url, withIntermediateDirectories: true, attributes: nil)
-        }
-    }
-    
-    func contentsOfDirectoryWithAttributes(at url: URL) throws -> [(url: URL, attributes: [FileAttributeKey: Any])] {
-        let contents = try contentsOfDirectory(at: url, includingPropertiesForKeys: nil)
-        return try contents.map { fileURL in
-            let attributes = try attributesOfItem(atPath: fileURL.path)
-            return (fileURL, attributes)
-        }
-    }
-}
-
-// MARK: - TextEditorViewController
-class TextEditorViewController: UIViewController {
-    private let fileURL: URL
-    private let textView = UITextView()
-    private let fileManager = FileManager.default
-    
-    init(fileURL: URL) {
-        self.fileURL = fileURL
-        super.init(nibName: nil, bundle: nil)
-    }
-    
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-    
-    override func viewDidLoad() {
-        super.viewDidLoad()
-        setupUI()
-        loadTextContent()
-    }
-    
-    private func setupUI() {
-        title = fileURL.lastPathComponent
-        view.backgroundColor = .systemBackground
-        
-        // Configure text view
-        textView.font = UIFont.monospacedSystemFont(ofSize: 14, weight: .regular)
-        textView.autocapitalizationType = .none
-        textView.autocorrectionType = .no
-        textView.spellCheckingType = .no
-        textView.smartDashesType = .no
-        textView.smartQuotesType = .no
-        textView.smartInsertDeleteType = .no
-        textView.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(textView)
-        
-        NSLayoutConstraint.activate([
-            textView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-            textView.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
-            textView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
-            textView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor)
-        ])
-        
-        // Add save button
-        navigationItem.rightBarButtonItem = UIBarButtonItem(
-            barButtonSystemItem: .save,
-            target: self,
-            action: #selector(saveTextContent)
-        )
-    }
-    
-    private func loadTextContent() {
-        do {
-            let content = try String(contentsOf: fileURL, encoding: .utf8)
-            textView.text = content
-        } catch {
-            textView.text = "Error loading file: \(error.localizedDescription)"
-            textView.isEditable = false
-        }
-    }
-    
-    @objc private func saveTextContent() {
-        do {
-            try textView.text.write(to: fileURL, atomically: true, encoding: .utf8)
-            let alertController = UIAlertController(
-                title: "Saved",
-                message: "File has been saved successfully.",
-                preferredStyle: .alert
-            )
-            alertController.addAction(UIAlertAction(title: "OK", style: .default))
-            present(alertController, animated: true)
-        } catch {
-            let alertController = UIAlertController(
-                title: "Save Failed",
-                message: error.localizedDescription,
-                preferredStyle: .alert
-            )
-            alertController.addAction(UIAlertAction(title: "OK", style: .default))
-            present(alertController, animated: true)
-        }
-    }
-}
-// MARK: - PlistEditorViewController
-class PlistEditorViewController: UIViewController, UITableViewDelegate, UITableViewDataSource {
-    private let fileURL: URL
-    private let tableView = UITableView(frame: .zero, style: .grouped)
-    private var plistData: [String: Any] = [:]
-    private var keys: [String] = []
-    
-    init(fileURL: URL) {
-        self.fileURL = fileURL
-        super.init(nibName: nil, bundle: nil)
-    }
-    
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-    
-    override func viewDidLoad() {
-        super.viewDidLoad()
-        setupUI()
-        loadPlistContent()
-    }
-    
-    private func setupUI() {
-        title = fileURL.lastPathComponent
-        view.backgroundColor = .systemBackground
-        
-        tableView.delegate = self
-        tableView.dataSource = self
-        tableView.register(UITableViewCell.self, forCellReuseIdentifier: "PlistCell")
-        tableView.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(tableView)
-        
-        NSLayoutConstraint.activate([
-            tableView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-            tableView.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
-            tableView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
-            tableView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor)
-        ])
-        
-        navigationItem.rightBarButtonItem = UIBarButtonItem(
-            barButtonSystemItem: .save,
-            target: self,
-            action: #selector(savePlistContent)
-        )
-    }
-    
-    private func loadPlistContent() {
-        do {
-            let data = try Data(contentsOf: fileURL)
-            var format = PropertyListSerialization.PropertyListFormat.xml
-            plistData = try PropertyListSerialization.propertyList(from: data, options: .mutableContainersAndLeaves, format: &format) as? [String: Any] ?? [:]
-            keys = plistData.keys.sorted()
-            tableView.reloadData()
-        } catch {
-            showAlert(title: "Error Loading Plist", message: error.localizedDescription)
-        }
-    }
-    
-    @objc private func savePlistContent() {
-        do {
-            let data = try PropertyListSerialization.data(fromPropertyList: plistData, format: .xml, options: 0)
-            try data.write(to: fileURL)
-            showAlert(title: "Saved", message: "Plist file has been saved successfully.")
-        } catch {
-            showAlert(title: "Save Failed", message: error.localizedDescription)
-        }
-    }
-    
-    private func showAlert(title: String, message: String) {
-        let alertController = UIAlertController(
-            title: title,
-            message: message,
-            preferredStyle: .alert
-        )
-        alertController.addAction(UIAlertAction(title: "OK", style: .default))
-        present(alertController, animated: true)
-    }
-    
-    // MARK: - UITableViewDataSource
-    func numberOfSections(in tableView: UITableView) -> Int {
-        return 1
-    }
-    
-    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-        return keys.count
-    }
-    
-    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
-        let cell = tableView.dequeueReusableCell(withIdentifier: "PlistCell", for: indexPath)
-        let key = keys[indexPath.row]
-        let value = plistData[key]
-        
-        var configuration = cell.defaultContentConfiguration()
-        configuration.text = key
-        
-        if let stringValue = value as? String {
-            configuration.secondaryText = stringValue
-        } else if let numberValue = value as? NSNumber {
-            configuration.secondaryText = numberValue.stringValue
-        } else if let arrayValue = value as? [Any] {
-            configuration.secondaryText = "Array (\(arrayValue.count) items)"
-        } else if let dictValue = value as? [String: Any] {
-            configuration.secondaryText = "Dictionary (\(dictValue.count) items)"
-        } else if let boolValue = value as? Bool {
-            configuration.secondaryText = boolValue ? "true" : "false"
-        } else if value == nil {
-            configuration.secondaryText = "nil"
-        } else {
-            configuration.secondaryText = "Unsupported type"
-        }
-        
-        cell.contentConfiguration = configuration
-        return cell
-    }
-    
-    // MARK: - UITableViewDelegate
-    func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
-        tableView.deselectRow(at: indexPath, animated: true)
-        let key = keys[indexPath.row]
-        let value = plistData[key]
-        
-        if let stringValue = value as? String {
-            showEditStringAlert(for: key, value: stringValue)
-        } else if let numberValue = value as? NSNumber {
-            showEditNumberAlert(for: key, value: numberValue)
-        } else if let boolValue = value as? Bool {
-            toggleBoolValue(for: key, value: boolValue)
-        } else {
-            showAlert(title: "Unsupported Type", message: "Editing this type is not supported in this viewer.")
-        }
-    }
-    
-    private func showEditStringAlert(for key: String, value: String) {
-        let alertController = UIAlertController(
-            title: "Edit Value",
-            message: "Key: \(key)",
-            preferredStyle: .alert
-        )
-        
-        alertController.addTextField { textField in
-            textField.text = value
-        }
-        
-        let saveAction = UIAlertAction(title: "Save", style: .default) { [weak self] _ in
-            guard let self = self, let newValue = alertController.textFields?.first?.text else { return }
-            self.plistData[key] = newValue
-            self.tableView.reloadData()
-        }
-        
-        alertController.addAction(saveAction)
-        alertController.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        
-        present(alertController, animated: true)
-    }
-    
-    private func showEditNumberAlert(for key: String, value: NSNumber) {
-        let alertController = UIAlertController(
-            title: "Edit Value",
-            message: "Key: \(key)",
-            preferredStyle: .alert
-        )
-        
-        alertController.addTextField { textField in
-            textField.text = value.stringValue
-            textField.keyboardType = .numbersAndPunctuation
-        }
-        
-        let saveAction = UIAlertAction(title: "Save", style: .default) { [weak self] _ in
-            guard let self = self, let text = alertController.textFields?.first?.text else { return }
-            
-            if let intValue = Int(text) {
-                self.plistData[key] = intValue
-            } else if let doubleValue = Double(text) {
-                self.plistData[key] = doubleValue
-            } else {
-                self.showAlert(title: "Invalid Number", message: "Please enter a valid number.")
-                return
-            }
-            
-            self.tableView.reloadData()
-        }
-        
-        alertController.addAction(saveAction)
-        alertController.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        
-        present(alertController, animated: true)
-    }
-    
-    private func toggleBoolValue(for key: String, value: Bool) {
-        plistData[key] = !value
-        tableView.reloadData()
-    }
-}
-// MARK: - ImageViewerViewController
-class ImageViewerViewController: UIViewController {
-    private let fileURL: URL
-    private let scrollView = UIScrollView()
-    private let imageView = UIImageView()
-    
-    init(fileURL: URL) {
-        self.fileURL = fileURL
-        super.init(nibName: nil, bundle: nil)
-    }
-    
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-    
-    override func viewDidLoad() {
-        super.viewDidLoad()
-        setupUI()
-        loadImage()
-    }
-    
-    private func setupUI() {
-        title = fileURL.lastPathComponent
-        view.backgroundColor = .systemBackground
-        
-        // Configure scroll view
-        scrollView.delegate = self
-        scrollView.minimumZoomScale = 1.0
-        scrollView.maximumZoomScale = 5.0
-        scrollView.showsHorizontalScrollIndicator = false
-        scrollView.showsVerticalScrollIndicator = false
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(scrollView)
-        
-        // Configure image view
+    private let appIconImageView: UIImageView = {
+        let imageView = UIImageView()
         imageView.contentMode = .scaleAspectFit
+        imageView.tintColor = .systemBlue
+        imageView.layer.cornerRadius = 10
+        imageView.clipsToBounds = true
         imageView.translatesAutoresizingMaskIntoConstraints = false
-        scrollView.addSubview(imageView)
-        
-        NSLayoutConstraint.activate([
-            scrollView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-            scrollView.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
-            
-            imageView.widthAnchor.constraint(equalTo: scrollView.widthAnchor),
-            imageView.heightAnchor.constraint(equalTo: scrollView.heightAnchor),
-            imageView.centerXAnchor.constraint(equalTo: scrollView.centerXAnchor),
-            imageView.centerYAnchor.constraint(equalTo: scrollView.centerYAnchor)
-        ])
-        
-        // Add share button
-        navigationItem.rightBarButtonItem = UIBarButtonItem(
-            barButtonSystemItem: .action,
-            target: self,
-            action: #selector(shareImage)
-        )
-        
-        // Add double tap gesture recognizer
-        let doubleTapGesture = UITapGestureRecognizer(target: self, action: #selector(handleDoubleTap(_:)))
-        doubleTapGesture.numberOfTapsRequired = 2
-        scrollView.addGestureRecognizer(doubleTapGesture)
-    }
-    
-    private func loadImage() {
-        guard let image = UIImage(contentsOfFile: fileURL.path) else {
-            showErrorAlert(message: "Failed to load image.")
-            return
-        }
-        
-        imageView.image = image
-    }
-    
-    @objc private func shareImage() {
-        guard let image = imageView.image else { return }
-        
-        let activityViewController = UIActivityViewController(
-            activityItems: [image, fileURL],
-            applicationActivities: nil
-        )
-        
-        // For iPad support
-        if let popoverController = activityViewController.popoverPresentationController {
-            popoverController.barButtonItem = navigationItem.rightBarButtonItem
-        }
-        
-        present(activityViewController, animated: true)
-    }
-    
-    @objc private func handleDoubleTap(_ gesture: UITapGestureRecognizer) {
-        if scrollView.zoomScale > scrollView.minimumZoomScale {
-            scrollView.setZoomScale(scrollView.minimumZoomScale, animated: true)
-        } else {
-            let point = gesture.location(in: imageView)
-            let scrollSize = scrollView.frame.size
-            let size = CGSize(
-                width: scrollSize.width / scrollView.maximumZoomScale,
-                height: scrollSize.height / scrollView.maximumZoomScale
-            )
-            let origin = CGPoint(
-                x: point.x - size.width / 2,
-                y: point.y - size.height / 2
-            )
-            scrollView.zoom(to: CGRect(origin: origin, size: size), animated: true)
-        }
-    }
-    
-    private func showErrorAlert(message: String) {
-        let alertController = UIAlertController(
-            title: "Error",
-            message: message,
-            preferredStyle: .alert
-        )
-        alertController.addAction(UIAlertAction(title: "OK", style: .default))
-        present(alertController, animated: true)
-    }
-}
-
-// MARK: - UIScrollViewDelegate Extension for ImageViewerViewController
-extension ImageViewerViewController: UIScrollViewDelegate {
-    func viewForZooming(in scrollView: UIScrollView) -> UIView? {
         return imageView
-    }
+    }()
     
-    func scrollViewDidZoom(_ scrollView: UIScrollView) {
-        centerImageInScrollView()
-    }
+    private let appNameLabel: UILabel = {
+        let label = UILabel()
+        label.font = UIFont.systemFont(ofSize: 16, weight: .semibold)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        return label
+    }()
     
-    private func centerImageInScrollView() {
-        let offsetX = max((scrollView.bounds.width - scrollView.contentSize.width) * 0.5, 0)
-        let offsetY = max((scrollView.bounds.height - scrollView.contentSize.height) * 0.5, 0)
-        
-        scrollView.contentInset = UIEdgeInsets(
-            top: offsetY,
-            left: offsetX,
-            bottom: 0,
-            right: 0
-        )
-    }
-}
-
-// MARK: - PDFViewerViewController
-class PDFViewerViewController: UIViewController {
-    private let fileURL: URL
-    private let webView = WKWebView()
+    private let bundleIDLabel: UILabel = {
+        let label = UILabel()
+        label.font = UIFont.systemFont(ofSize: 12)
+        label.textColor = .secondaryLabel
+        label.translatesAutoresizingMaskIntoConstraints = false
+        return label
+    }()
     
-    init(fileURL: URL) {
-        self.fileURL = fileURL
-        super.init(nibName: nil, bundle: nil)
-    }
+    private let versionLabel: UILabel = {
+        let label = UILabel()
+        label.font = UIFont.systemFont(ofSize: 12)
+        label.textColor = .secondaryLabel
+        label.translatesAutoresizingMaskIntoConstraints = false
+        return label
+    }()
     
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
+    private let fileSizeLabel: UILabel = {
+        let label = UILabel()
+        label.font = UIFont.systemFont(ofSize: 12)
+        label.textColor = .secondaryLabel
+        label.translatesAutoresizingMaskIntoConstraints = false
+        return label
+    }()
     
-    override func viewDidLoad() {
-        super.viewDidLoad()
-        setupUI()
-        loadPDF()
-    }
+    private let dateLabel: UILabel = {
+        let label = UILabel()
+        label.font = UIFont.systemFont(ofSize: 12)
+        label.textColor = .secondaryLabel
+        label.translatesAutoresizingMaskIntoConstraints = false
+        return label
+    }()
     
-    private func setupUI() {
-        title = fileURL.lastPathComponent
-        view.backgroundColor = .systemBackground
-        
-        webView.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(webView)
-        
-        NSLayoutConstraint.activate([
-            webView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-            webView.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
-            webView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
-            webView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor)
-        ])
-        
-        // Add share button
-        navigationItem.rightBarButtonItem = UIBarButtonItem(
-            barButtonSystemItem: .action,
-            target: self,
-            action: #selector(sharePDF)
-        )
-    }
-    
-    private func loadPDF() {
-        webView.load(URLRequest(url: fileURL))
-    }
-    
-    @objc private func sharePDF() {
-        let activityViewController = UIActivityViewController(
-            activityItems: [fileURL],
-            applicationActivities: nil
-        )
-        
-        // For iPad support
-        if let popoverController = activityViewController.popoverPresentationController {
-            popoverController.barButtonItem = navigationItem.rightBarButtonItem
-        }
-        
-        present(activityViewController, animated: true)
-    }
-}
-// MARK: - HexEditorViewController
-class HexEditorViewController: UIViewController, UITableViewDelegate, UITableViewDataSource {
-    private let fileURL: URL
-    private let tableView = UITableView()
-    private var fileData: Data?
-    private let bytesPerRow = 16
-    
-    init(fileURL: URL) {
-        self.fileURL = fileURL
-        super.init(nibName: nil, bundle: nil)
-    }
-    
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-    
-    override func viewDidLoad() {
-        super.viewDidLoad()
-        setupUI()
-        loadFileData()
-    }
-    
-    private func setupUI() {
-        title = fileURL.lastPathComponent
-        view.backgroundColor = .systemBackground
-        
-        tableView.delegate = self
-        tableView.dataSource = self
-        tableView.register(HexTableViewCell.self, forCellReuseIdentifier: "HexCell")
-        tableView.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(tableView)
-        
-        NSLayoutConstraint.activate([
-            tableView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-            tableView.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
-            tableView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
-            tableView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor)
-        ])
-    }
-    
-    private func loadFileData() {
-        do {
-            fileData = try Data(contentsOf: fileURL)
-            tableView.reloadData()
-        } catch {
-            showErrorAlert(message: "Failed to load file data: \(error.localizedDescription)")
-        }
-    }
-    
-    private func showErrorAlert(message: String) {
-        let alertController = UIAlertController(
-            title: "Error",
-            message: message,
-            preferredStyle: .alert
-        )
-        alertController.addAction(UIAlertAction(title: "OK", style: .default))
-        present(alertController, animated: true)
-    }
-    
-    // MARK: - UITableViewDataSource
-    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-        guard let data = fileData else { return 0 }
-        return Int(ceil(Double(data.count) / Double(bytesPerRow)))
-    }
-    
-    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
-        let cell = tableView.dequeueReusableCell(withIdentifier: "HexCell", for: indexPath) as! HexTableViewCell
-        
-        guard let data = fileData else { return cell }
-        
-        let startOffset = indexPath.row * bytesPerRow
-        let endOffset = min(startOffset + bytesPerRow, data.count)
-        let rowData = data[startOffset..<endOffset]
-        
-        cell.configure(withOffset: startOffset, data: rowData, bytesPerRow: bytesPerRow)
-        return cell
-    }
-    
-    // MARK: - UITableViewDelegate
-    func tableView(_ tableView: UITableView, heightForRowAt indexPath: IndexPath) -> CGFloat {
-        return 44
-    }
-}
-
-// MARK: - HexTableViewCell
-class HexTableViewCell: UITableViewCell {
-    private let offsetLabel = UILabel()
-    private let hexLabel = UILabel()
-    private let asciiLabel = UILabel()
+    // MARK: - Initialization
     
     override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
         super.init(style: style, reuseIdentifier: reuseIdentifier)
@@ -1511,129 +1724,305 @@ class HexTableViewCell: UITableViewCell {
     }
     
     required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
+        super.init(coder: coder)
+        setupUI()
     }
     
+    // MARK: - UI Setup
+    
     private func setupUI() {
-        // Configure offset label
-        offsetLabel.font = UIFont.monospacedSystemFont(ofSize: 14, weight: .regular)
-        offsetLabel.textColor = .secondaryLabel
-        offsetLabel.translatesAutoresizingMaskIntoConstraints = false
-        contentView.addSubview(offsetLabel)
-        
-        // Configure hex label
-        hexLabel.font = UIFont.monospacedSystemFont(ofSize: 14, weight: .regular)
-        hexLabel.translatesAutoresizingMaskIntoConstraints = false
-        contentView.addSubview(hexLabel)
-        
-        // Configure ASCII label
-        asciiLabel.font = UIFont.monospacedSystemFont(ofSize: 14, weight: .regular)
-        asciiLabel.textColor = .secondaryLabel
-        asciiLabel.translatesAutoresizingMaskIntoConstraints = false
-        contentView.addSubview(asciiLabel)
+        contentView.addSubview(appIconImageView)
+        contentView.addSubview(appNameLabel)
+        contentView.addSubview(bundleIDLabel)
+        contentView.addSubview(versionLabel)
+        contentView.addSubview(fileSizeLabel)
+        contentView.addSubview(dateLabel)
         
         NSLayoutConstraint.activate([
-            offsetLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
-            offsetLabel.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
-            offsetLabel.widthAnchor.constraint(equalToConstant: 80),
+            appIconImageView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
+            appIconImageView.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
+            appIconImageView.widthAnchor.constraint(equalToConstant: 50),
+            appIconImageView.heightAnchor.constraint(equalToConstant: 50),
             
-            hexLabel.leadingAnchor.constraint(equalTo: offsetLabel.trailingAnchor, constant: 8),
-            hexLabel.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
+            appNameLabel.leadingAnchor.constraint(equalTo: appIconImageView.trailingAnchor, constant: 12),
+            appNameLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16),
+            appNameLabel.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 10),
             
-            asciiLabel.leadingAnchor.constraint(equalTo: hexLabel.trailingAnchor, constant: 16),
-            asciiLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16),
-            asciiLabel.centerYAnchor.constraint(equalTo: contentView.centerYAnchor)
+            bundleIDLabel.leadingAnchor.constraint(equalTo: appIconImageView.trailingAnchor, constant: 12),
+            bundleIDLabel.topAnchor.constraint(equalTo: appNameLabel.bottomAnchor, constant: 2),
+            
+            versionLabel.leadingAnchor.constraint(equalTo: bundleIDLabel.trailingAnchor, constant: 8),
+            versionLabel.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -16),
+            versionLabel.topAnchor.constraint(equalTo: appNameLabel.bottomAnchor, constant: 2),
+            
+            fileSizeLabel.leadingAnchor.constraint(equalTo: appIconImageView.trailingAnchor, constant: 12),
+            fileSizeLabel.topAnchor.constraint(equalTo: bundleIDLabel.bottomAnchor, constant: 2),
+            
+            dateLabel.leadingAnchor.constraint(equalTo: fileSizeLabel.trailingAnchor, constant: 16),
+            dateLabel.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -16),
+            dateLabel.topAnchor.constraint(equalTo: bundleIDLabel.bottomAnchor, constant: 2)
         ])
     }
     
-    func configure(withOffset offset: Int, data: Data, bytesPerRow: Int) {
-        // Format offset
-        offsetLabel.text = String(format: "0x%08X", offset)
-        
-        // Format hex representation
-        var hexString = ""
-        var asciiString = ""
-        
-        for (index, byte) in data.enumerated() {
-            hexString += String(format: "%02X ", byte)
-            
-            // Add space after 8 bytes for better readability
-            if index == 7 {
-                hexString += " "
-            }
-            
-            // Format ASCII representation
-            if byte >= 32 && byte <= 126 { // Printable ASCII range
-                asciiString += String(UnicodeScalar(byte))
-            } else {
-                asciiString += "."
-            }
-        }
-        
-        // Pad hex string to align all rows
-        let missingBytes = bytesPerRow - data.count
-        if missingBytes > 0 {
-            for i in 0..<missingBytes {
-                hexString += "   "
-                // Add extra space after 8 bytes
-                if data.count + i == 7 {
-                    hexString += " "
-                }
-            }
-        }
-        
-        hexLabel.text = hexString
-        asciiLabel.text = asciiString
-    }
-}
-
-// MARK: - ZIPFoundation Implementation
-// This is a simplified version of ZIPFoundation for the purpose of this example
-// In a real app, you would use the actual ZIPFoundation library
-extension FileManager {
-    func unzipItem(at sourceURL: URL, to destinationURL: URL) throws {
-        // This is a placeholder for the actual ZIPFoundation implementation
-        // In a real app, you would use the ZIPFoundation library's unzipItem method
-        
-        // For demonstration purposes, we'll create a simple directory structure
-        // to simulate unzipping a file
-        
-        let tempDirectory = destinationURL.appendingPathComponent(UUID().uuidString)
-        try createDirectory(at: tempDirectory, withIntermediateDirectories: true, attributes: nil)
-        
-        // Create a README.txt file in the unzipped directory
-        let readmeURL = tempDirectory.appendingPathComponent("README.txt")
-        let readmeContent = "This is a simulated unzipped file from \(sourceURL.lastPathComponent)."
-        try readmeContent.write(to: readmeURL, atomically: true, encoding: .utf8)
-        
-        // Create a sample directory in the unzipped directory
-        let sampleDirURL = tempDirectory.appendingPathComponent("sample_directory")
-        try createDirectory(at: sampleDirURL, withIntermediateDirectories: true, attributes: nil)
-        
-        // Create a sample file in the sample directory
-        let sampleFileURL = sampleDirURL.appendingPathComponent("sample_file.txt")
-        let sampleContent = "This is a sample file in the unzipped directory."
-        try sampleContent.write(to: sampleFileURL, atomically: true, encoding: .utf8)
-    }
-}
-
-// MARK: - WKWebView Import
-import WebKit
-
-// MARK: - AppDelegate
-@main
-class AppDelegate: UIResponder, UIApplicationDelegate {
-    var window: UIWindow?
+    // MARK: - Configuration
     
-    func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
-        window = UIWindow(frame: UIScreen.main.bounds)
+    func configure(name: String, fileSize: String, modificationDate: String, iconImage: UIImage?) {
+        appNameLabel.text = name
+        fileSizeLabel.text = fileSize
+        dateLabel.text = modificationDate
+        appIconImageView.image = iconImage
         
-        let homeViewController = HomeViewController()
-        let navigationController = UINavigationController(rootViewController: homeViewController)
+        // Hide app-specific info until we have it
+        bundleIDLabel.isHidden = true
+        versionLabel.isHidden = true
+    }
+    
+    func updateAppInfo(name: String, bundleID: String, version: String) {
+        appNameLabel.text = name
+        bundleIDLabel.text = bundleID
+        versionLabel.text = "v\(version)"
         
-        window?.rootViewController = navigationController
-        window?.makeKeyAndVisible()
+        // Show app-specific info
+        bundleIDLabel.isHidden = false
+        versionLabel.isHidden = false
+    }
+    
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        appNameLabel.text = nil
+        bundleIDLabel.text = nil
+        versionLabel.text = nil
+        fileSizeLabel.text = nil
+        dateLabel.text = nil
+        appIconImageView.image = nil
+        accessoryType = .none
         
-        return true
+        // Hide app-specific info
+        bundleIDLabel.isHidden = true
+        versionLabel.isHidden = true
+    }
+}
+// MARK: - HomeViewUtilities
+
+class HomeViewUtilities {
+    
+    func handleError(in viewController: UIViewController, error: Error, withTitle title: String) {
+        let message = error.localizedDescription
+        showAlert(in: viewController, title: title, message: message)
+        
+        // Log error
+        os_log("Error: %{public}@", log: OSLog.default, type: .error, message)
+    }
+    
+    func showAlert(in viewController: UIViewController, title: String, message: String) {
+        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: NSLocalizedString("OK", comment: "OK button"), style: .default))
+        viewController.present(alert, animated: true)
+    }
+    
+    func showConfirmationAlert(in viewController: UIViewController, title: String, message: String, confirmTitle: String, cancelTitle: String = NSLocalizedString("Cancel", comment: "Cancel button"), confirmHandler: @escaping () -> Void) {
+        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        
+        alert.addAction(UIAlertAction(title: cancelTitle, style: .cancel))
+        
+        alert.addAction(UIAlertAction(title: confirmTitle, style: .default) { _ in
+            confirmHandler()
+        })
+        
+        viewController.present(alert, animated: true)
+    }
+}
+// MARK: - HomeViewFileHandlers
+
+class HomeViewFileHandlers {
+    
+    private let fileManager = FileManager.default
+    
+    func createDirectory(at url: URL) throws {
+        try fileManager.createDirectory(at: url, withIntermediateDirectories: true, attributes: nil)
+    }
+    
+    func deleteFile(at url: URL) throws {
+        try fileManager.removeItem(at: url)
+    }
+    
+    func moveFile(from sourceURL: URL, to destinationURL: URL) throws {
+        try fileManager.moveItem(at: sourceURL, to: destinationURL)
+    }
+    
+    func copyFile(from sourceURL: URL, to destinationURL: URL) throws {
+        try fileManager.copyItem(at: sourceURL, to: destinationURL)
+    }
+    
+    func fileExists(at url: URL) -> Bool {
+        return fileManager.fileExists(atPath: url.path)
+    }
+    
+    func isDirectory(at url: URL) -> Bool {
+        var isDirectory: ObjCBool = false
+        fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory)
+        return isDirectory.boolValue
+    }
+    
+    func getFileAttributes(for url: URL) -> [FileAttributeKey: Any]? {
+        do {
+            return try fileManager.attributesOfItem(atPath: url.path)
+        } catch {
+            print("Error getting file attributes: \(error)")
+            return nil
+        }
+    }
+}
+// MARK: - AppDownload
+
+protocol DownloadDelegate: AnyObject {
+    func downloadProgress(progress: Float)
+    func downloadDidFinish(fileURL: URL)
+    func downloadDidFail(with error: Error)
+    func extractionProgress(progress: Float)
+    func extractionDidFinish(directoryURL: URL)
+    func extractionDidFail(with error: Error)
+}
+
+class AppDownload: NSObject {
+    
+    // MARK: - Properties
+    
+    weak var delegate: DownloadDelegate?
+    private var downloadTask: URLSessionDownloadTask?
+    private var session: URLSession!
+    private var destinationDirectory: URL?
+    private var isDownloading = false
+    
+    // MARK: - Initialization
+    
+    override init() {
+        super.init()
+        let configuration = URLSessionConfiguration.default
+        session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+    }
+    
+    // MARK: - Download Methods
+    
+    func downloadApp(withID appID: String, to directory: URL) {
+        guard !isDownloading else { return }
+        
+        isDownloading = true
+        destinationDirectory = directory
+        
+        // First, fetch the iTunes metadata to get the download URL
+        let metadataURL = URL(string: "https://itunes.apple.com/lookup?id=\(appID)")!
+        
+        let task = URLSession.shared.dataTask(with: metadataURL) { [weak self] data, response, error in
+            guard let self = self else { return }
+            
+            if let error = error {
+                self.isDownloading = false
+                self.delegate?.downloadDidFail(with: error)
+                return
+            }
+            
+            guard let data = data else {
+                self.isDownloading = false
+                self.delegate?.downloadDidFail(with: NSError(domain: "AppDownloadError", code: 1, userInfo: [NSLocalizedDescriptionKey: "No data received"]))
+                return
+            }
+            
+            do {
+                if let json = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
+                   let results = json["results"] as? [[String: Any]],
+                   let firstResult = results.first,
+                   let trackName = firstResult["trackName"] as? String,
+                   let bundleID = firstResult["bundleId"] as? String {
+                    
+                    // Now we have the app info, start the actual download
+                    self.startDownload(appID: appID, appName: trackName, bundleID: bundleID)
+                } else {
+                    self.isDownloading = false
+                    self.delegate?.downloadDidFail(with: NSError(domain: "AppDownloadError", code: 2, userInfo: [NSLocalizedDescriptionKey: "App not found"]))
+                }
+            } catch {
+                self.isDownloading = false
+                self.delegate?.downloadDidFail(with: error)
+            }
+        }
+        
+        task.resume()
+    }
+    
+    private func startDownload(appID: String, appName: String, bundleID: String) {
+        // Create a URL for the app download
+        // Note: This is a placeholder. In a real app, you would need to use a proper API or service
+        // that can provide IPA downloads, which is not officially supported by Apple
+        let downloadURLString = "https://example.com/apps/\(appID)/download"
+        guard let downloadURL = URL(string: downloadURLString) else {
+            isDownloading = false
+            delegate?.downloadDidFail(with: NSError(domain: "AppDownloadError", code: 3, userInfo: [NSLocalizedDescriptionKey: "Invalid download URL"]))
+            return
+        }
+        
+        downloadTask = session.downloadTask(with: downloadURL)
+        downloadTask?.resume()
+    }
+    
+    func cancelDownload() {
+        downloadTask?.cancel()
+        isDownloading = false
+    }
+}
+
+// MARK: - URLSessionDownloadDelegate
+
+extension AppDownload: URLSessionDownloadDelegate {
+    
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+        guard let destinationDirectory = destinationDirectory else {
+            isDownloading = false
+            delegate?.downloadDidFail(with: NSError(domain: "AppDownloadError", code: 4, userInfo: [NSLocalizedDescriptionKey: "Destination directory not set"]))
+            return
+        }
+        
+        // Get suggested filename from the response
+        var fileName = "app.ipa"
+        if let suggestedFilename = downloadTask.response?.suggestedFilename {
+            fileName = suggestedFilename
+        } else if let url = downloadTask.originalRequest?.url?.lastPathComponent, !url.isEmpty {
+            fileName = url
+        }
+        
+        // Ensure it has .ipa extension
+        if !fileName.lowercased().hasSuffix(".ipa") {
+            fileName += ".ipa"
+        }
+        
+        let destinationURL = destinationDirectory.appendingPathComponent(fileName)
+        
+        do {
+            // Remove existing file if needed
+            if FileManager.default.fileExists(atPath: destinationURL.path) {
+                try FileManager.default.removeItem(at: destinationURL)
+            }
+            
+            // Move downloaded file to destination
+            try FileManager.default.moveItem(at: location, to: destinationURL)
+            
+            isDownloading = false
+            delegate?.downloadDidFinish(fileURL: destinationURL)
+        } catch {
+            isDownloading = false
+            delegate?.downloadDidFail(with: error)
+        }
+    }
+    
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
+        let progress = Float(totalBytesWritten) / Float(totalBytesExpectedToWrite)
+        delegate?.downloadProgress(progress: progress)
+    }
+    
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error = error {
+            isDownloading = false
+            delegate?.downloadDidFail(with: error)
+        }
     }
 }
