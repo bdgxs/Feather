@@ -17,6 +17,20 @@ jobs:
         git ls-files --others --ignored --exclude-standard > ignored-files.txt
         echo "::set-output name=ignored_files::$(cat ignored-files.txt)"
 
+    - name: Delete existing release
+      if: always()
+      run: |
+        existing_release_id=$(gh api -X GET "repos/${{ github.repository }}/releases/tags/files" --jq '.id' || echo "")
+        if [ -n "$existing_release_id" ]; then
+          gh api -X DELETE "repos/${{ github.repository }}/releases/$existing_release_id"
+        fi
+        existing_tag_sha=$(git show-ref -s files || echo "")
+        if [ -n "$existing_tag_sha" ]; then
+          git push origin --delete files
+        fi
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
     - name: Create a release
       id: create_release
       uses: actions/create-release@v1
