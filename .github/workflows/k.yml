@@ -12,9 +12,10 @@ jobs:
       uses: actions/checkout@v3
 
     - name: List ignored files
+      id: list_ignored_files
       run: |
         git ls-files --others --ignored --exclude-standard > ignored-files.txt
-        cat ignored-files.txt
+        echo "::set-output name=ignored_files::$(cat ignored-files.txt)"
 
     - name: Create a release
       id: create_release
@@ -36,3 +37,8 @@ jobs:
         asset_path: ignored-files.txt
         asset_name: ignored-files.txt
         asset_content_type: text/plain
+
+    - name: Clean up
+      if: always()
+      run: |
+        rm ignored-files.txt
