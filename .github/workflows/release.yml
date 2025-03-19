@@ -46,7 +46,3 @@ jobs:
           draft: true
         env:
           GITHUB_TOKEN: ${{ env.GITHUB_TOKEN }}
-
-
-
-Update this to use the latest version of Xcode an anything else yoy think this needs
