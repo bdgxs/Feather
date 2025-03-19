@@ -6,6 +6,7 @@ import Foundation
 protocol FileHandlingDelegate: AnyObject {
     var documentsDirectory: URL { get }
     var activityIndicator: UIActivityIndicatorView { get }
+    var homeDelegate: HomeDelegate? { get }
     func loadFiles()
     func present(_ viewControllerToPresent: UIViewController, animated flag: Bool, completion: (() -> Void)?)
 }
@@ -33,6 +34,7 @@ class HomeViewFileHandlers {
         do {
             try fileManager.createDirectory(at: folderURL, withIntermediateDirectories: true, attributes: nil)
             viewController.loadFiles()
+            viewController.homeDelegate?.didAddFile(file: folderName)
             completion(.success(folderURL))
         } catch {
             utilities.handleError(in: viewController as! UIViewController, error: error, withTitle: "Creating Folder")
@@ -45,6 +47,7 @@ class HomeViewFileHandlers {
         if !fileManager.fileExists(atPath: fileURL.path) {
             fileManager.createFile(atPath: fileURL.path, contents: nil, attributes: nil)
             viewController.loadFiles()
+            viewController.homeDelegate?.didAddFile(file: fileName)
             completion(.success(fileURL))
         } else {
             let error = NSError(domain: "FileExists", code: 1, userInfo: [NSLocalizedDescriptionKey: "File already exists"])
@@ -62,6 +65,7 @@ class HomeViewFileHandlers {
                 DispatchQueue.main.async {
                     viewController.activityIndicator.stopAnimating()
                     viewController.loadFiles()
+                    viewController.homeDelegate?.didUpdateFile(file: newName)
                     completion(.success(destinationURL))
                 }
             } catch {
@@ -83,6 +87,7 @@ class HomeViewFileHandlers {
                 DispatchQueue.main.async {
                     viewController.activityIndicator.stopAnimating()
                     viewController.loadFiles()
+                    viewController.homeDelegate?.didRemoveFile(file: fileURL.lastPathComponent)
                     completion(.success(()))
                 }
             } catch {
@@ -110,6 +115,7 @@ class HomeViewFileHandlers {
                 DispatchQueue.main.async {
                     viewController.activityIndicator.stopAnimating()
                     viewController.loadFiles()
+                    viewController.homeDelegate?.didUpdateFile(file: destinationName)
                     completion(.success(destinationURL))
                 }
             } catch {
