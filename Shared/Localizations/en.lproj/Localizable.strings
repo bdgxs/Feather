@@ -419,3 +419,58 @@
 "LOGS_VIEW_SECTION_TITLE_COPY" = "Copy Logs";
 "LOGS_VIEW_SUCCESS_DESCRIPTION" = "Log contents have been copied to clipboard.";
 "LOGS_VIEW_FAIL_DESCRIPTION" = "Failed to copy log contents.";
+// MARK: - File Browser
+
+// Navigation and UI
+"Files" = "Files";
+"Select Items" = "Select Items";
+"%d Selected" = "%d Selected";
+"Edit" = "Edit";
+"Select" = "Select";
+"Move" = "Move";
+"Copy" = "Copy";
+"Find" = "Find";
+"Download" = "Download";
+"Extract" = "Extract";
+
+// File operations
+"New Folder" = "New Folder";
+"Enter a name for the new folder" = "Enter a name for the new folder";
+"Folder Name" = "Folder Name";
+"Select Folder" = "Select Folder";
+"../ (Parent Directory)" = "../ (Parent Directory)";
+"Confirm Deletion" = "Confirm Deletion";
+"Are you sure you want to delete '%@'?" = "Are you sure you want to delete '%@'?";
+"Rename File" = "Rename File";
+"Enter a new name" = "Enter a new name";
+"Move Items" = "Move Items";
+"Copy Items" = "Copy Items";
+
+// Search
+"Search files..." = "Search files...";
+"Enter text to search for" = "Enter text to search for";
+"Search text" = "Search text";
+"Not Found" = "Not Found";
+"The text was not found" = "The text was not found";
+
+// Status messages
+"No files found" = "No files found";
+"Download Complete" = "Download Complete";
+"File downloaded successfully" = "File downloaded successfully";
+"Download Failed" = "Download Failed";
+"Extraction Complete" = "Extraction Complete";
+"App extracted successfully" = "App extracted successfully";
+"Extraction Failed" = "Extraction Failed";
+"Import Incomplete" = "Import Incomplete";
+"Failed to import %d files" = "Failed to import %d files";
+"Move Incomplete" = "Move Incomplete";
+"Failed to move %d files" = "Failed to move %d files";
+"Deletion Failed" = "Deletion Failed";
+"Rename Failed" = "Rename Failed";
+"Save Failed" = "Save Failed";
+"Unsaved Changes" = "Unsaved Changes";
+"Do you want to save your changes?" = "Do you want to save your changes?";
+"Saved" = "Saved";
+"Image has been saved to your photos" = "Image has been saved to your photos";
+"Failed to load image" = "Failed to load image";
+"Discard" = "Discard";
