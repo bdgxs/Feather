@@ -3,7 +3,7 @@ import ZIPFoundation
 import Foundation
 import os.log
 
-class HomeViewController: UIViewController, UISearchResultsUpdating, UITableViewDragDelegate, UITableViewDropDelegate, UITableViewDelegate, UITableViewDataSource, UIDocumentPickerDelegate, UITextViewDelegate, FileHandlingDelegate {
+class HomeViewController: UIViewController, UISearchResultsUpdating, UITableViewDragDelegate, UITableViewDropDelegate, UITableViewDelegate, UITableViewDataSource, UIDocumentPickerDelegate, UITextViewDelegate {
     
     // MARK: - Properties
     private var fileList: [String] = []
@@ -298,7 +298,7 @@ class HomeViewController: UIViewController, UISearchResultsUpdating, UITableView
     }
     
     func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
-        let cell = tableView.dequeueReusableCell(withIdentifier: "FileCell", for: indexPath) as! FileTableViewCell
+        let cell = tableView.dequeueReuseableCell(withIdentifier: "FileCell", for: indexPath) as! FileTableViewCell
         let fileName = searchController.isActive ? filteredFileList[indexPath.row] : fileList[indexPath.row]
         let fileURL = documentsDirectory.appendingPathComponent(fileName)
         let file = File(url: fileURL)
@@ -312,7 +312,7 @@ class HomeViewController: UIViewController, UISearchResultsUpdating, UITableView
         showFileOptions(for: fileURL)
     }
     
-    // MARK: - File Handling Delegate
+    // MARK: - File Handling Delegate Methods
     func present(_ viewControllerToPresent: UIViewController, animated flag: Bool, completion: (() -> Void)?) {
         present(viewControllerToPresent, animated: flag, completion: completion)
     }
