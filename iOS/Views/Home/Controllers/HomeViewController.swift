@@ -34,8 +34,19 @@ class HomeViewController: UIViewController, UISearchResultsUpdating, UITableView
         // Implement drop delegate method
     }
 
-    // HomeDelegate method
+    // HomeDelegate methods
+    func didAddFile(file: String) {
+        // Implement didAddFile method
+        print("File added: \(file)")
+    }
+
+    func didRemoveFile(file: String) {
+        // Implement didRemoveFile method
+        print("File removed: \(file)")
+    }
+
     func didUpdateFile(file: String) {
-        // Implement HomeDelegate method
+        // Implement didUpdateFile method
+        print("File updated: \(file)")
     }
 }
