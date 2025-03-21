@@ -8,3 +8,4 @@
 #include "zsign.hpp"
 #include "openssl_tools.hpp"
 #import "CPUXLib.h"
+#import <CommonCrypto/CommonCrypto.h>
