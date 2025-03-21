@@ -8,7 +8,6 @@ import WebKit
 import Nuke
 import SWCompression
 import AlertKit
-import OpenSSL
 import ImageIO
 
 class HomeViewController: UIViewController, UITableViewDelegate, UITableViewDataSource, UISearchResultsUpdating, UIDocumentInteractionControllerDelegate, UITableViewDragDelegate, UITableViewDropDelegate, UITextViewDelegate, UIImagePickerControllerDelegate, UINavigationControllerDelegate {
@@ -564,8 +563,7 @@ class HomeViewController: UIViewController, UITableViewDelegate, UITableViewData
                 self?.showRenameAlert(for: fileURL)
             }
 
-            let deleteAction = UIAction(title: "Delete", image: UIImage(systemName: "
-trash"), attributes: .destructive) { [weak self] _ in
+            let deleteAction = UIAction(title: "Delete", image: UIImage(systemName: "trash"), attributes: .destructive) { [weak self] _ in
                 self?.deleteFile(at: fileURL)
             }
 
@@ -1042,8 +1040,7 @@ trash"), attributes: .destructive) { [weak self] _ in
 
                 widthTextField.topAnchor.constraint(equalTo: imageView.bottomAnchor, constant: 20),
                 widthTextField.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 20),
-                widthTextField.widthAnchor.constraint
-                .constraint(equalToConstant: 100),
+                widthTextField.widthAnchor.constraint(equalToConstant: 100),
 
                 heightTextField.topAnchor.constraint(equalTo: imageView.bottomAnchor, constant: 20),
                 heightTextField.leadingAnchor.constraint(equalTo: widthTextField.trailingAnchor, constant: 10),
@@ -1115,48 +1112,66 @@ trash"), attributes: .destructive) { [weak self] _ in
     }
 }
 
-// MARK: - AES Encryption/Decryption
+// MARK: - AES Encryption/Decryption using CommonCrypto
 
 extension AES {
     static func encrypt(_ data: Data, password: String) throws -> Data {
         guard let keyData = password.data(using: .utf8) else { throw NSError(domain: "Invalid password", code: 0, userInfo: nil) }
-        let key = keyData.withUnsafeBytes { $0.baseAddress!.assumingMemoryBound(to: UInt8.self) }
-        let keyLength = kCCKeySizeAES256
+        let key = keyData.withUnsafeBytes { $0.load(as: [UInt8].self) }
+        let iv = [UInt8](repeating: 0, count: kCCBlockSizeAES128)
 
-        var iv = Data(count: kCCBlockSizeAES128)
-        _ = iv.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, kCCBlockSizeAES128, $0.baseAddress!.assumingMemoryBound(to: UInt8.self)) }
-
-        var buffer = [UInt8](repeating: 0, count: data.count + kCCBlockSizeAES128)
-        var bufferSize = 0
-
-        let result = data.withUnsafeBytes { dataBytes in
-            iv.withUnsafeBytes { ivBytes in
-                CCCrypt(CCOperation(kCCEncrypt), CCAlgorithm(kCCAlgorithmAES128), CCOptions(kCCOptionPKCS7Padding), key, keyLength, ivBytes.baseAddress!.assumingMemoryBound(to: UInt8.self), dataBytes.baseAddress!.assumingMemoryBound(to: UInt8.self), data.count, &buffer, buffer.count, &bufferSize)
+        let encryptedDataLength = data.count + kCCBlockSizeAES128
+        var encryptedData = Data(count: encryptedDataLength)
+        
+        var numBytesEncrypted: size_t = 0
+        let cryptStatus = encryptedData.withUnsafeMutableBytes { encryptedBytes in
+            data.withUnsafeBytes { dataBytes in
+                CCCrypt(CCOperation(kCCEncrypt),
+                        CCAlgorithm(kCCAlgorithmAES128),
+                        CCOptions(kCCOptionPKCS7Padding),
+                        key, key.count,
+                        iv,
+                        dataBytes.baseAddress, data.count,
+                        encryptedBytes.baseAddress, encryptedDataLength,
+                        &numBytesEncrypted)
             }
         }
-
-        guard result == kCCSuccess else { throw NSError(domain: "Encryption failed", code: Int(result), userInfo: nil) }
-        return iv + Data(bytes: buffer, count: bufferSize)
+        
+        guard cryptStatus == kCCSuccess else {
+            throw NSError(domain: "Encryption failed", code: Int(cryptStatus), userInfo: nil)
+        }
+        
+        encryptedData.removeSubrange(numBytesEncrypted..<encryptedData.count)
+        return encryptedData
     }
 
     static func decrypt(_ data: Data, password: String) throws -> Data {
         guard let keyData = password.data(using: .utf8) else { throw NSError(domain: "Invalid password", code: 0, userInfo: nil) }
-        let key = keyData.withUnsafeBytes { $0.baseAddress!.assumingMemoryBound(to: UInt8.self) }
-        let keyLength = kCCKeySizeAES256
+        let key = keyData.withUnsafeBytes { $0.load(as: [UInt8].self) }
+        let iv = [UInt8](repeating: 0, count: kCCBlockSizeAES128)
 
-        let iv = data.prefix(kCCBlockSizeAES128)
-        let encryptedData = data.suffix(from: kCCBlockSizeAES128)
-
-        var buffer = [UInt8](repeating: 0, count: encryptedData.count)
-        var bufferSize = 0
-
-        let result = encryptedData.withUnsafeBytes { encryptedBytes in
-            iv.withUnsafeBytes { ivBytes in
-                CCCrypt(CCOperation(kCCDecrypt), CCAlgorithm(kCCAlgorithmAES128), CCOptions(kCCOptionPKCS7Padding), key, keyLength, ivBytes.baseAddress!.assumingMemoryBound(to: UInt8.self), encryptedBytes.baseAddress!.assumingMemoryBound(to: UInt8.self), encryptedData.count, &buffer, buffer.count, &bufferSize)
+        let decryptedDataLength = data.count + kCCBlockSizeAES128
+        var decryptedData = Data(count: decryptedDataLength)
+        
+        var numBytesDecrypted: size_t = 0
+        let cryptStatus = decryptedData.withUnsafeMutableBytes { decryptedBytes in
+            data.withUnsafeBytes { dataBytes in
+                CCCrypt(CCOperation(kCCDecrypt),
+                        CCAlgorithm(kCCAlgorithmAES128),
+                        CCOptions(kCCOptionPKCS7Padding),
+                        key, key.count,
+                        iv,
+                        dataBytes.baseAddress, data.count,
+                        decryptedBytes.baseAddress, decryptedDataLength,
+                        &numBytesDecrypted)
             }
         }
-
-        guard result == kCCSuccess else { throw NSError(domain: "Decryption failed", code: Int(result), userInfo: nil) }
-        return Data(bytes: buffer, count: bufferSize)
+        
+        guard cryptStatus == kCCSuccess else {
+            throw NSError(domain: "Decryption failed", code: Int(cryptStatus), userInfo: nil)
+        }
+        
+        decryptedData.removeSubrange(numBytesDecrypted..<decryptedData.count)
+        return decryptedData
     }
 }
