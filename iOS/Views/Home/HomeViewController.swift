@@ -17,16 +17,14 @@ protocol FileHandlingDelegate: AnyObject {
 }
 
 class HomeViewController: UIViewController, UITableViewDelegate, UITableViewDataSource, UISearchResultsUpdating, UIDocumentPickerDelegate, UIDropInteractionDelegate, UIDocumentInteractionControllerDelegate {
-
+    
     // MARK: - Properties
 
-    private var fileList: [String] =
-    private var filteredFileList: [String] =
+    private var fileList: [String] = []
+    private var filteredFileList: [String] = []
     private let fileManager = FileManager.default
     private let searchController = UISearchController(searchResultsController: nil)
     private var sortOrder: SortOrder = .name
-    // let fileHandlers = HomeViewFileHandlers() // No longer needed
-    // let utilities = HomeViewUtilities() // No longer needed
     private var currentDirectoryURL: URL!
 
     var documentsDirectory: URL {
@@ -113,7 +111,7 @@ class HomeViewController: UIViewController, UITableViewDelegate, UITableViewData
     }
 
     @objc private func importFile() {
-        let documentPicker = UIDocumentPickerViewController(forContentTypes: [UTType.item])
+        let documentPicker = UIDocumentPickerViewController(forOpeningContentTypes: [UTType.item])
         documentPicker.delegate = self
         documentPicker.allowsMultipleSelection = true
         present(documentPicker, animated: true, completion: nil)
@@ -450,7 +448,7 @@ class HomeViewController: UIViewController, UITableViewDelegate, UITableViewData
         pdfView.document = PDFDocument(url: url)
         pdfView.autoScales = true
 
-        let pdfViewController = UIViewController()
+                let pdfViewController = UIViewController()
         pdfViewController.view = pdfView
 
         let closeButton = UIBarButtonItem(barButtonSystemItem: .done, target: self, action: #selector(dismissPDFView))
@@ -473,7 +471,7 @@ class HomeViewController: UIViewController, UITableViewDelegate, UITableViewData
             viewImage(at: fileURL)
         } else if fileType == UTType.text {
             editTextFile(at: fileURL)
-        } else if UTType.zip {
+        } else if fileType == UTType.zip {
             viewZipContents(at: fileURL)
         } else if fileType == UTType("public.archive" as CFString) { // General archive type
             viewZipContents(at: fileURL) // Treat other archives like ZIPs
@@ -553,10 +551,10 @@ class HomeViewController: UIViewController, UITableViewDelegate, UITableViewData
 
     func viewZipContents(at fileURL: URL) {
         do {
-            let zip = Archive(url: fileURL, accessMode: .read)
+            let zip = try Archive(url: fileURL, accessMode: .read)
 
             var entries = [String]()
-            for entry in zip! {
+            for entry in zip {
                 entries.append(entry.path)
             }
 
@@ -725,7 +723,7 @@ extension HomeViewController {
         case .name:
             return files.sorted { $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending }
         case .date:
-            return files.sorted {
+            return files sorted {
                 let date1 = try? FileManager.default.attributesOfItem(atPath: $0.path)[.fileCreationDate] as? Date ?? Date.distantPast
                 let date2 = try? FileManager.default.attributesOfItem(atPath: $1.path)[.fileCreationDate] as? Date ?? Date.distantPast
                 return date1.compare(date2) == .orderedAscending
@@ -758,4 +756,110 @@ extension HomeViewController {
 
 extension UTType {
     static let ipa = UTType(filenameExtension: "ipa")!
+}
+
+// MARK: - Extensions
+
+extension HomeViewController {
+    func presentAlert(title: String?, message: String?) {
+        let alertController = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        alertController.addAction(UIAlertAction(title: "OK", style: .default, handler: nil))
+        present(alertController, animated: true, completion: nil)
+    }
+
+    func presentTextInputAlert(title: String?, message: String?, textFieldPlaceholder: String?, completion: @escaping (String?) -> Void) {
+        let alertController = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        alertController.addTextField { textField in
+            textField.placeholder = textFieldPlaceholder
+        }
+        alertController.addAction(UIAlertAction(title: "Cancel", style: .cancel, handler: { _ in
+            completion(nil)
+        }))
+        alertController.addAction(UIAlertAction(title: "OK", style: .default, handler: { _ in
+            if let textFieldText = alertController.textFields?.first?.text {
+                completion(textFieldText)
+            } else {
+                completion(nil)
+            }
+        }))
+        present(alertController, animated: true, completion: nil)
+    }
+
+    func handleError(error: Error, withTitle title: String? = nil) {
+        os_log("Error: %{public}@", log: OSLog.default, type: .error, error.localizedDescription)
+        let alertController = UIAlertController(title: title ?? "Error", message: error.localizedDescription, preferredStyle: .alert)
+        alertController.addAction(UIAlertAction(title: "OK", style: .default, handler: nil))
+        present(alertController, animated: true, completion: nil)
+    }
+
+    func isDirectory(at url: URL) -> Bool {
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) {
+            return isDir.boolValue
+        } else {
+            return false
+        }
+    }
+
+    func getFileIcon(for url: URL) -> UIImage {
+        let uti = UTTypeCreatePreferredIdentifierForTag(kUTTagClassFilenameExtension, url.pathExtension as CFString, nil)?.takeRetainedValue()
+
+        var systemIcon: UIImage
+        if uti != nil {
+            systemIcon = UIImage(systemName: "doc")! // Default document icon
+            if UTTypeConformsTo(uti!, kUTTypeImage) {
+                systemIcon = UIImage(systemName: "photo")!
+            } else if UTTypeConformsTo(uti!, kUTTypeMovie) {
+                systemIcon = UIImage(systemName: "film")!
+            } else if UTTypeConformsTo(uti!, kUTTypeAudio) {
+                systemIcon = UIImage(systemName: "music.note")!
+            } else if UTTypeConformsTo(uti!, kUTTypeText) {
+                systemIcon = UIImage(systemName: "doc.plaintext")!
+            } else if UTTypeConformsTo(uti!, kUTTypeDirectory) {
+                systemIcon = UIImage(systemName: "folder")!
+            } else if UTTypeConformsTo(uti!, kUTTypePDF) {
+                systemIcon = UIImage(systemName: "doc.pdf")!
+            } else if UTTypeConformsTo(uti!, kUTTypeArchive) {
+                systemIcon = UIImage(systemName: "archivebox")!
+            }
+        } else {
+            systemIcon = UIImage(systemName: "questionmark.circle")! // Unknown file type icon
+        }
+        return systemIcon
+    }
+
+    func sortFiles(_ files: [URL], by sortOrder: HomeViewController.SortOrder) -> [URL] {
+        switch sortOrder {
+        case .name:
+            return files.sorted { $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending }
+        case .date:
+            return files.sorted {
+                let date1 = try? FileManager.default.attributesOfItem(atPath: $0.path)[.fileCreationDate] as? Date ?? Date.distantPast
+                let date2 = try? FileManager.default.attributesOfItem(atPath: $1.path)[.fileCreationDate] as? Date ?? Date.distantPast
+                return date1.compare(date2) == .orderedAscending
+            }
+        case .size:
+            return files.sorted {
+                let size1 = try? FileManager.default.attributesOfItem(atPath: $0.path)[.fileSize] as? NSNumber ?? 0
+                let size2 = try? FileManager.default.attributesOfItem(atPath: $1.path)[.fileSize] as? NSNumber ?? 0
+                return size1.compare(size2) == .orderedAscending
+            }
+        }
+    }
+
+    func copyPickedFiles(urls: [URL], to destinationDirectory: URL) -> URL? {
+        // Implement the logic to copy files from the picked URLs to the destination directory.
+        // Handle potential errors during the copy process.
+        // Return the destination URL if successful, or nil if not.
+        for url in urls {
+            let destinationURL = destinationDirectory.appendingPathComponent(url.lastPathComponent)
+            do {
+                try FileManager.default.copyItem(at: url, to: destinationURL)
+            } catch {
+                print("Error copying file: \(error)")
+                return nil
+            }
+        }
+        return destinationDirectory
+    }
 }
