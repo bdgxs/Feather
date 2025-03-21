@@ -88,13 +88,16 @@ class HomeViewController: UIViewController, UITableViewDelegate, UITableViewData
     private func setupUI() {
         view.backgroundColor = .systemBackground
         title = currentDirectoryPath.lastPathComponent
+        
         let menuButton = UIBarButtonItem(image: UIImage(systemName: "ellipsis.circle"), style: .plain, target: self, action: #selector(showMenu))
         let uploadButton = UIBarButtonItem(image: UIImage(systemName: "square.and.arrow.up"), style: .plain, target: self, action: #selector(importFile))
         let addButton = UIBarButtonItem(image: UIImage(systemName: "folder.badge.plus"), style: .plain, target: self, action: #selector(addDirectory))
         navigationItem.rightBarButtonItems = [menuButton, uploadButton, addButton]
+        
         if currentDirectoryPath != documentsDirectory {
             navigationItem.leftBarButtonItem = UIBarButtonItem(image: UIImage(systemName: "arrow.left"), style: .plain, target: self, action: #selector(navigateToParentDirectory))
         }
+        
         view.addSubview(fileListTableView)
         fileListTableView.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
@@ -271,191 +274,130 @@ class HomeViewController: UIViewController, UITableViewDelegate, UITableViewData
         }
     }
 
-    func openFile(at indexPath: IndexPath) {
-        let fileList = searchController.isActive ? filteredFileList : self.fileList
-        guard indexPath.row < fileList.count else { return }
-        let fileName = fileList[indexPath.row]
-        let fileURL = currentDirectoryPath.appendingPathComponent(fileName)
-        var isDirectory: ObjCBool = false
-        guard fileManager.fileExists(atPath: fileURL.path, isDirectory: &isDirectory) else {
-            utilities.showAlert(in: self, title: NSLocalizedString("Error", comment: "Error title"), message: NSLocalizedString("File no longer exists", comment: "File missing message"))
-            loadFiles()
-            return
-        }
-        if isDirectory.boolValue {
-            let directoryVC = HomeViewController(directoryPath: fileURL)
-            navigationController?.pushViewController(directoryVC, animated: true)
-            return
-        }
-        let fileExtension = fileURL.pathExtension.lowercased()
-        switch fileExtension {
-        case "ipa":
-            handleIPAFile(at: fileURL)
-        case "txt", "log", "json", "xml", "plist", "html", "css", "js", "swift", "m", "h", "c", "cpp":
-            openTextFile(at: fileURL)
-        case "jpg", "jpeg", "png", "gif", "heic", "heif", "webp":
-            openImageFile(at: fileURL)
-        case "mp4", "mov", "m4v", "3gp":
-            openVideoFile(at: fileURL)
-        case "pdf":
-            openPDFFile(at: fileURL)
-        case "zip":
-            handleZipFile(at: fileURL)
-        case "bin", "dat", "hex":
-            openHexEditor(for: fileURL)
-        default:
-            if let uti = UTType(filenameExtension: fileExtension) {
-                if uti.conforms(to: .text) {
-                    openTextFile(at: fileURL)
-                } else if uti.conforms(to: .image) {
-                    openImageFile(at: fileURL)
-                } else if uti.conforms(to: .movie) {
-                    openVideoFile(at: fileURL)
-                } else if uti.conforms(to: .pdf) {
-                    openPDFFile(at: fileURL)
-                } else if uti.conforms(to: .archive) {
-                    handleZipFile(at: fileURL)
-                } else {
-                    let previewController = UIDocumentInteractionController(url: fileURL)
-                    previewController.delegate = self
-                    if !previewController.presentPreview(animated: true) {
-                        previewController.presentOptionsMenu(from: view.bounds, in: view, animated: true)
-                    }
-                }
+    private func filterContentForSearchText(_ searchText: String) {
+        filteredFileList = fileList.filter { fileName in
+            let fileURL = currentDirectoryPath.appendingPathComponent(fileName)
+            if fileManager.isDirectory(atPath: fileURL.path) {
+                return fileName.localizedCaseInsensitiveContains(searchText)
             } else {
-                let previewController = UIDocumentInteractionController(url: fileURL)
-                previewController.delegate = self
-                previewController.presentOptionsMenu(from: view.bounds, in: view, animated: true)
-            }
-        }
-    }
-
-    private func handleIPAFile(at fileURL: URL) {
-        let alert = UIAlertController(
-            title: NSLocalizedString("IPA File", comment: "IPA file alert title"),
-            message: NSLocalizedString("What would you like to do with this IPA file?", comment: "IPA options message"),
-            preferredStyle: .actionSheet
-        )
-        alert.addAction(UIAlertAction(title: NSLocalizedString("Extract", comment: "Extract action"), style: .default) { [weak self] _ in
-            self?.extractIPA(at: fileURL)
-        })
-        alert.addAction(UIAlertAction(title: NSLocalizedString("View Info", comment: "View info action"), style: .default) { [weak self] _ in
-            self?.showIPAInfo(for: fileURL)
-        })
-        alert.addAction(UIAlertAction(title: NSLocalizedString("Edit Contents", comment: "Edit contents action"), style: .default) { [weak self] _ in
-            self?.editIPAContents(at: fileURL)
-        })
-        alert.addAction(UIAlertAction(title: NSLocalizedString("Cancel", comment: "Cancel button"), style: .cancel))
-        if let popoverController = alert.popoverPresentationController {
-            popoverController.sourceView = view
-            popoverController.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0)
-            popoverController.permittedArrowDirections = []
-        }
-        present(alert, animated: true)
-    }
-
-    private func editIPAContents(at fileURL: URL) {
-        extractIPA(at: fileURL) { [weak self] extractedDirectoryURL in
-            if let extractedDirectoryURL = extractedDirectoryURL {
-                let fileBrowserVC = HomeViewController(directoryPath: extractedDirectoryURL)
-                self?.navigationController?.pushViewController(fileBrowserVC, animated: true)
-            }
-        }
-    }
-
-    private func extractIPA(at fileURL: URL, completion: ((URL?) -> Void)? = nil) {
-        let progressAlert = showProgressAlert(title: "Extracting IPA", message: "Please wait...")
-        DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                let destinationURL = self.currentDirectoryPath.appendingPathComponent(fileURL.deletingPathExtension().lastPathComponent)
-                try self.fileManager.createDirectory(at: destinationURL, withIntermediateDirectories: true, attributes: nil)
-                try ZIPFoundation.unzipItem(zipFileURL: fileURL, destination: destinationURL)
-                DispatchQueue.main.async {
-                    self.dismissProgressAlert(alert: progressAlert)
-                    self.loadFiles()
-                    completion?(destinationURL)
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    self.dismissProgressAlert(alert: progressAlert)
-                    self.utilities.handleError(in: self, error: error, withTitle: "IPA Extraction Failed")
-                    completion?(nil)
+                do {
+                    let fileContent = try String(contentsOf: fileURL, encoding: .utf8)
+                    return fileName.localizedCaseInsensitiveContains(searchText) || fileContent.localizedCaseInsensitiveContains(searchText)
+                } catch {
+                    return fileName.localizedCaseInsensitiveContains(searchText)
                 }
             }
         }
+        fileListTableView.reloadData()
     }
 
-    private func showIPAInfo(for fileURL: URL) {
-        // Implement IPA info viewing logic
+    private func showProgressAlert(title: String, message: String) -> UIAlertController {
+        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        let activityIndicator = UIActivityIndicatorView(frame: CGRect(x: 10, y: 5, width: 50, height: 50))
+        activityIndicator.style = .large
+        activityIndicator.startAnimating()
+        alert.view.addSubview(activityIndicator)
+        present(alert, animated: true, completion: nil)
+        return alert
     }
 
-    private func modifyIPA(at fileURL: URL) {
-        // Implement IPA modification logic
+    private func dismissProgressAlert(alert: UIAlertController) {
+        alert.dismiss(animated: true, completion: nil)
     }
 
-    // MARK: - File Type Handlers
-
-    private func openTextFile(at fileURL: URL) {
+    private func unzipFile(at fileURL: URL) {
         do {
-            let text = try String(contentsOf: fileURL, encoding: .utf8)
-            let textEditorVC = TextEditorViewController(fileURL: fileURL, text: text)
-            let navController = UINavigationController(rootViewController: textEditorVC)
-            present(navController, animated: true)
+            let destinationURL = currentDirectoryPath.appendingPathComponent(fileURL.deletingPathExtension().lastPathComponent)
+            try fileManager.createDirectory(at: destinationURL, withIntermediateDirectories: true, attributes: nil)
+            try fileManager.unzipItem(at: fileURL, to: destinationURL)
+            loadFiles()
         } catch {
-            do {
-                let text = try String(contentsOf: fileURL, encoding: .isoLatin1)
-                let textEditorVC = TextEditorViewController(fileURL: fileURL, text: text)
-                let navController = UINavigationController(rootViewController: textEditorVC)
-                present(navController, animated: true)
-            } catch {
-                utilities.handleError(in: self, error: error, withTitle: NSLocalizedString("Failed to Open Text File", comment: "Error title"))
-            }
+            utilities.handleError(in: self, error: error, withTitle: "Unzip Failed")
         }
     }
 
-    private func openImageFile(at fileURL: URL) {
-        let imageViewer = ImageViewerViewController(imageURL: fileURL)
-        let navController = UINavigationController(rootViewController: imageViewer)
-        present(navController, animated: true)
+    private func deleteFile(at fileURL: URL) {
+        do {
+            try fileManager.removeItem(at: fileURL)
+            loadFiles()
+        } catch {
+            utilities.handleError(in: self, error: error, withTitle: "Delete Failed")
+        }
     }
 
-    private func openVideoFile(at fileURL: URL) {
-        let videoViewer = VideoViewerViewController(videoURL: fileURL)
-        let navController = UINavigationController(rootViewController: videoViewer)
-        present(navController, animated: true)
+    private func renameFile(at fileURL: URL, newName: String) {
+        let newURL = fileURL.deletingLastPathComponent().appendingPathComponent(newName)
+        do {
+            try fileManager.moveItem(at: fileURL, to: newURL)
+            loadFiles()
+        } catch {
+            utilities.handleError(in: self, error: error, withTitle: "Rename Failed")
+        }
     }
 
-    private func openPDFFile(at fileURL: URL) {
-        let pdfViewer = PDFViewerViewController(pdfURL: fileURL)
-        let navController = UINavigationController(rootViewController: pdfViewer)
-        present(navController, animated: true)
+    @objc private func showMenu() {
+        let menuAlert = UIAlertController(title: nil, message: nil, preferredStyle: .actionSheet)
+        let sortByNameAction = UIAlertAction(title: "Sort by Name", style: .default) { [weak self] _ in
+            self?.sortOrder = .name
+            self?.sortFiles()
+        }
+        let sortByDateAction = UIAlertAction(title: "Sort by Date", style: .default) { [weak self] _ in
+            self?.sortOrder = .date
+            self?.sortFiles()
+        }
+        let sortBySizeAction = UIAlertAction(title: "Sort by Size", style: .default) { [weak self] _ in
+            self?.sortOrder = .size
+            self?.sortFiles()
+        }
+        let cancelAction = UIAlertAction(title: "Cancel", style: .cancel, handler: nil)
+        
+        menuAlert.addAction(sortByNameAction)
+        menuAlert.addAction(sortByDateAction)
+        menuAlert.addAction(sortBySizeAction)
+        menuAlert.addAction(cancelAction)
+        
+        present(menuAlert, animated: true, completion: nil)
     }
 
-    private func handleZipFile(at fileURL: URL) {
-        let alert = UIAlertController(title: "Zip File", message: "What would you like to do?", preferredStyle: .actionSheet)
-        alert.addAction(UIAlertAction(title: "Unzip", style: .default) { [weak self] _ in
-            self?.unzipFile(at: fileURL)
-        })
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        present(alert, animated: true)
+    @objc private func importFile() {
+        let documentPicker = UIDocumentPickerViewController(forOpeningContentTypes: [.item], asCopy: true)
+        documentPicker.delegate = self
+        present(documentPicker, animated: true, completion: nil)
     }
 
-    func openHexEditor(for fileURL: URL) {
-        let hexEditorVC = HexEditorViewController(fileURL: fileURL)
-        let navController = UINavigationController(rootViewController: hexEditorVC)
-        present(navController, animated: true)
+    @objc private func addDirectory() {
+        let alertController = UIAlertController(title: "New Folder", message: "Enter the name of the new folder", preferredStyle: .alert)
+        alertController.addTextField { textField in
+            textField.placeholder = "Folder Name"
+        }
+        
+        let createAction = UIAlertAction(title: "Create", style: .default) { [weak self, weak alertController] _ in
+            guard let self = self, let textField = alertController?.textFields?.first, let folderName = textField.text, !folderName.isEmpty else { return }
+            let newFolderURL = self.currentDirectoryPath.appendingPathComponent(folderName)
+            do {
+                try self.fileManager.createDirectory(at: newFolderURL, withIntermediateDirectories: false, attributes: nil)
+                self.loadFiles()
+            } catch {
+                self.utilities.handleError(in: self, error: error, withTitle: "Failed to Create Folder")
+            }
+        }
+        
+        let cancelAction = UIAlertAction(title: "Cancel", style: .cancel, handler: nil)
+        
+        alertController.addAction(createAction)
+        alertController.addAction(cancelAction)
+        
+        present(alertController, animated: true, completion: nil)
     }
 
-    func openPlistEditor(for fileURL: URL) {
-        let plistEditorVC = PlistEditorViewController(fileURL: fileURL)
-        let navController = UINavigationController(rootViewController: plistEditorVC)
-        present(navController, animated: true)
+    @objc private func navigateToParentDirectory() {
+        let parentDirectory = currentDirectoryPath.deletingLastPathComponent()
+        let parentVC = HomeViewController(directoryPath: parentDirectory)
+        navigationController?.pushViewController(parentVC, animated: true)
     }
 
-    func openImageEditor(for fileURL: URL) {
-        let imageEditorVC = ImageEditorViewController(imageURL: fileURL)
-        let navController = UINavigationController(rootViewController: imageEditorVC)
-        present(navController, animated: true)
+    @objc private func refreshData() {
+        loadFiles()
     }
 
     // MARK: - Encryption/Decryption
@@ -488,690 +430,326 @@ class HomeViewController: UIViewController, UITableViewDelegate, UITableViewData
 
     func updateSearchResults(for searchController: UISearchController) {
         if let searchText = searchController.searchBar.text, !searchText.isEmpty {
-            filteredFileList = fileList.filter { fileName in
-                let fileURL = currentDirectoryPath.appendingPathComponent(fileName)
-                if fileManager.isDirectory(atPath: fileURL.path) {
-                    return fileName.localizedCaseInsensitiveContains(searchText)
-                } else {
-                    do {
-                        let fileContent = try String(contentsOf: fileURL, encoding: .utf8)
-                        return fileName.localizedCaseInsensitiveContains(searchText) || fileContent.localizedCaseInsensitiveContains(searchText)
-                    } catch {
-                        return fileName.localizedCaseInsensitiveContains(searchText)
-                    }
-                }
-            }
+            filterContentForSearchText(searchText)
         } else {
             filteredFileList = fileList
-        }
-        fileListTableView.reloadData()
-    }
-
-    // MARK: - Table View Delegate and Data Source
-
-    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-        return searchController.isActive ? filteredFileList.count : fileList.count
-    }
-
-    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
-        let fileList = searchController.isActive ? filteredFileList : self.fileList
-        let fileName = fileList[indexPath.row]
-        let fileURL = currentDirectoryPath.appendingPathComponent(fileName)
-        var isDirectory: ObjCBool = false
-        fileManager.fileExists(atPath: fileURL.path, isDirectory: &isDirectory)
-
-        if fileURL.pathExtension.lowercased() == "ipa" {
-            let cell = tableView.dequeueReusableCell(withIdentifier: "AppCell", for: indexPath) as! AppTableViewCell
-            cell.fileNameLabel.text = fileName
-            cell.fileImageView.image = UIImage(systemName: "app.gift")
-            return cell
-        } else {
-            let cell = tableView.dequeueReusableCell(withIdentifier: "FileCell", for: indexPath) as! FileTableViewCell
-            cell.fileNameLabel.text = fileName
-            cell.fileImageView.image = isDirectory.boolValue ? UIImage(systemName: "folder") : UIImage(systemName: "doc")
-            return cell
+            fileListTableView.reloadData()
         }
     }
 
-    func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
-        openFile(at: indexPath)
+// MARK: - Table View Delegate and Data Source
+
+func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+    return searchController.isActive ? filteredFileList.count : fileList.count
+}
+
+func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+    let fileList = searchController.isActive ? filteredFileList : self.fileList
+    let fileName = fileList[indexPath.row]
+    let fileURL = currentDirectoryPath.appendingPathComponent(fileName)
+    var isDirectory: ObjCBool = false
+    fileManager.fileExists(atPath: fileURL.path, isDirectory: &isDirectory)
+
+    if fileURL.pathExtension.lowercased() == "ipa" {
+        let cell = tableView.dequeueReusableCell(withIdentifier: "AppCell", for: indexPath) as! AppTableViewCell
+        cell.fileNameLabel.text = fileName
+        cell.fileImageView.image = UIImage(systemName: "app.gift")
+        return cell
+    } else {
+        let cell = tableView.dequeueReusableCell(withIdentifier: "FileCell", for: indexPath) as! FileTableViewCell
+        cell.fileNameLabel.text = fileName
+        cell.fileImageView.image = isDirectory.boolValue ? UIImage(systemName: "folder") : UIImage(systemName: "doc")
+        return cell
     }
+}
 
-    func tableView(_ tableView: UITableView, trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath) -> UISwipeActionsConfiguration? {
-        let fileList = searchController.isActive ? filteredFileList : self.fileList
-        let fileName = fileList[indexPath.row]
-        let fileURL = currentDirectoryPath.appendingPathComponent(fileName)
+func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+    openFile(at: indexPath)
+}
 
-        let deleteAction = UIContextualAction(style: .destructive, title: "Delete") { [weak self] (_, _, completionHandler) in
+func tableView(_ tableView: UITableView, trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath) -> UISwipeActionsConfiguration? {
+    let fileList = searchController.isActive ? filteredFileList : self.fileList
+    let fileName = fileList[indexPath.row]
+    let fileURL = currentDirectoryPath.appendingPathComponent(fileName)
+
+    let deleteAction = UIContextualAction(style: .destructive, title: "Delete") { [weak self] (_, _, completionHandler) in
+        self?.deleteFile(at: fileURL)
+        completionHandler(true)
+    }
+    deleteAction.image = UIImage(systemName: "trash")
+    deleteAction.backgroundColor = .systemRed
+
+    let configuration = UISwipeActionsConfiguration(actions: [deleteAction])
+    return configuration
+}
+
+func tableView(_ tableView: UITableView, contextMenuConfigurationForRowAt indexPath: IndexPath, point: CGPoint) -> UIContextMenuConfiguration? {
+    let fileList = searchController.isActive ? filteredFileList : self.fileList
+    let fileName = fileList[indexPath.row]
+    let fileURL = currentDirectoryPath.appendingPathComponent(fileName)
+
+    return UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { suggestedActions in
+        let renameAction = UIAction(title: "Rename", image: UIImage(systemName: "pencil")) { [weak self] _ in
+            self?.showRenameAlert(for: fileURL)
+        }
+
+        let deleteAction = UIAction(title: "Delete", image: UIImage(systemName: "trash"), attributes: .destructive) { [weak self] _ in
             self?.deleteFile(at: fileURL)
-            completionHandler(true)
         }
-        deleteAction.image = UIImage(systemName: "trash")
-        deleteAction.backgroundColor = .systemRed
 
-        let configuration = UISwipeActionsConfiguration(actions: [deleteAction])
-        return configuration
-    }
-
-    func tableView(_ tableView: UITableView, contextMenuConfigurationForRowAt indexPath: IndexPath, point: CGPoint) -> UIContextMenuConfiguration? {
-        let fileList = searchController.isActive ? filteredFileList : self.fileList
-        let fileName = fileList[indexPath.row]
-        let fileURL = currentDirectoryPath.appendingPathComponent(fileName)
-
-        return UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { suggestedActions in
-            let renameAction = UIAction(title: "Rename", image: UIImage(systemName: "pencil")) { [weak self] _ in
-                self?.showRenameAlert(for: fileURL)
-            }
-
-            let deleteAction = UIAction(title: "Delete", image: UIImage(systemName: "trash"), attributes: .destructive) { [weak self] _ in
-                self?.deleteFile(at: fileURL)
-            }
-
-            let zipAction = UIAction(title: "Zip", image: UIImage(systemName: "zipper")) { [weak self] _ in
-                self?.zipFile(at: fileURL)
-            }
-
-            let unzipAction = UIAction(title: "Unzip", image: UIImage(systemName: "box.and.arrow.down")) { [weak self] _ in
-                self?.unzipFile(at: fileURL)
-            }
-
-            let shareAction = UIAction(title: "Share", image: UIImage(systemName: "square.and.arrow.up")) { [weak self] _ in
-                self?.shareFile(at: fileURL)
-            }
-
-            return UIMenu(title: "", children: [renameAction, deleteAction, zipAction, unzipAction, shareAction])
+        let zipAction = UIAction(title: "Zip", image: UIImage(systemName: "zipper")) { [weak self] _ in
+            self?.zipFile(at: fileURL)
         }
-    }
 
-    private func showRenameAlert(for fileURL: URL) {
-        let alert = UIAlertController(title: "Rename File", message: "Enter new file name:", preferredStyle: .alert)
-        alert.addTextField { textField in
-            textField.text = fileURL.lastPathComponent
+        let unzipAction = UIAction(title: "Unzip", image: UIImage(systemName: "box.and.arrow.down")) { [weak self] _ in
+            self?.unzipFile(at: fileURL)
         }
-        alert.addAction(UIAlertAction(title: "Rename", style: .default) { [weak self, weak alert] _ in
-            if let newName = alert?.textFields?.first?.text {
-                self?.renameFile(at: fileURL, newName: newName)
-            }
-        })
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        present(alert, animated: true)
-    }
 
-    // MARK: - Drag and Drop
-
-    func tableView(_ tableView: UITableView, itemsForBeginning session: UIDragSession, at indexPath: IndexPath) -> [UIDragItem] {
-        let fileList = searchController.isActive ? filteredFileList : self.fileList
-        let fileName = fileList[indexPath.row]
-        let fileURL = currentDirectoryPath.appendingPathComponent(fileName)
-        let itemProvider = NSItemProvider(url: fileURL)
-        let dragItem = UIDragItem(itemProvider: itemProvider)
-        dragItem.localObject = fileURL
-        return [dragItem]
-    }
-
-    func tableView(_ tableView: UITableView, performDropWith coordinator: UITableViewDropCoordinator) {
-        let destinationIndexPath: IndexPath
-        if let indexPath = coordinator.destinationIndexPath {
-            destinationIndexPath = indexPath
-        } else {
-            let row = tableView.numberOfRows(inSection: 0)
-            destinationIndexPath = IndexPath(row: row, section: 0)
+        let shareAction = UIAction(title: "Share", image: UIImage(systemName: "square.and.arrow.up")) { [weak self] _ in
+            self?.shareFile(at: fileURL)
         }
-        coordinator.items.forEach { item in
-            item.dragItem.itemProvider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { (urlData, error) in
-                if let urlData = urlData as? URL, let destinationURL = self.currentDirectoryPath.appendingPathComponent(self.fileList[destinationIndexPath.row]).appendingPathComponent(urlData.lastPathComponent) {
-                    do {
-                        try self.fileManager.moveItem(at: urlData, to: destinationURL)
-                        DispatchQueue.main.async {
-                            self.loadFiles()
-                        }
-                    } catch {
-                        print("Error moving file: \(error)")
+
+        return UIMenu(title: "", children: [renameAction, deleteAction, zipAction, unzipAction, shareAction])
+    }
+}
+
+private func showRenameAlert(for fileURL: URL) {
+    let alert = UIAlertController(title: "Rename File", message: "Enter new file name:", preferredStyle: .alert)
+    alert.addTextField { textField in
+        textField.text = fileURL.lastPathComponent
+    }
+    alert.addAction(UIAlertAction(title: "Rename", style: .default) { [weak self, weak alert] _ in
+        if let newName = alert?.textFields?.first?.text {
+            self?.renameFile(at: fileURL, newName: newName)
+        }
+    })
+    alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+    present(alert, animated: true)
+}
+
+// MARK: - Drag and Drop
+
+func tableView(_ tableView: UITableView, itemsForBeginning session: UIDragSession, at indexPath: IndexPath) -> [UIDragItem] {
+    let fileList = searchController.isActive ? filteredFileList : self.fileList
+    let fileName = fileList[indexPath.row]
+    let fileURL = currentDirectoryPath.appendingPathComponent(fileName)
+    let itemProvider = NSItemProvider(contentsOf: fileURL)
+    let dragItem = UIDragItem(itemProvider: itemProvider!)
+    dragItem.localObject = fileURL
+    return [dragItem]
+}
+
+func tableView(_ tableView: UITableView, performDropWith coordinator: UITableViewDropCoordinator) {
+    let destinationIndexPath: IndexPath
+    if let indexPath = coordinator.destinationIndexPath {
+        destinationIndexPath = indexPath
+    } else {
+        let row = tableView.numberOfRows(inSection: 0)
+        destinationIndexPath = IndexPath(row: row, section: 0)
+    }
+    coordinator.items.forEach { item in
+        item.dragItem.itemProvider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { (urlData, error) in
+            if let urlData = urlData as? URL {
+                let destinationURL = self.currentDirectoryPath.appendingPathComponent(self.fileList[destinationIndexPath.row]).appendingPathComponent(urlData.lastPathComponent)
+                do {
+                    try self.fileManager.moveItem(at: urlData, to: destinationURL)
+                    DispatchQueue.main.async {
+                        self.loadFiles()
                     }
+                } catch {
+                    print("Error moving file: \(error)")
                 }
-            }
-        }
-    }
-
-    // MARK: - Multi-Select Actions
-
-    @objc private func toggleMultiSelectMode() {
-        isMultiSelectMode.toggle()
-        fileListTableView.allowsMultipleSelection = isMultiSelectMode
-        if isMultiSelectMode {
-            navigationItem.leftBarButtonItems = [cancelButton, actionButton]
-        } else {
-            navigationItem.leftBarButtonItem = multiSelectButton
-        }
-        fileListTableView.reloadData()
-    }
-
-    @objc private func cancelMultiSelect() {
-        isMultiSelectMode = false
-        fileListTableView.allowsMultipleSelection = false
-        navigationItem.leftBarButtonItem = multiSelectButton
-        selectedFiles.removeAll()
-        fileListTableView.reloadData()
-    }
-
-    @objc private func performBatchAction() {
-        // Implement batch actions for selected files
-    }
-
-    // MARK: - Background Tasks
-
-    @objc private func appDidEnterBackground() {
-        backgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "BackgroundTask") {
-            self.cancelBackgroundTask()
-        }
-    }
-
-    @objc private func appWillEnterForeground() {
-        cancelBackgroundTask()
-    }
-
-    private func beginBackgroundTask() {
-        backgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "BackgroundTask") {
-            self.cancelBackgroundTask()
-        }
-    }
-
-    private func cancelBackgroundTask() {
-        if backgroundTaskID != .invalid {
-            UIApplication.shared.endBackgroundTask(backgroundTaskID)
-            backgroundTaskID = .invalid
-        }
-    }
-
-    // MARK: - Helper Classes/Extensions
-
-    class HomeViewFileHandlers { }
-    class HomeViewUtilities {
-        func showAlert(in viewController: UIViewController, title: String, message: String) {
-            let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
-            alert.addAction(UIAlertAction(title: "OK", style: .default))
-            viewController.present(alert, animated: true)
-        }
-
-        func handleError(in viewController: UIViewController, error: Error, withTitle title: String) {
-            showAlert(in: viewController, title: title, message: error.localizedDescription)
-        }
-    }
-
-    // MARK: - Hex Editor View Controller
-
-    class HexEditorViewController: UIViewController, UISearchBarDelegate {
-        let fileURL: URL
-        let textView = UITextView()
-        let searchBar = UISearchBar()
-
-        init(fileURL: URL) {
-            self.fileURL = fileURL
-            super.init(nibName: nil, bundle: nil)
-        }
-
-        required init?(coder: NSCoder) {
-            fatalError("init(coder:) has not been implemented")
-        }
-
-        override func viewDidLoad() {
-            super.viewDidLoad()
-            setupUI()
-            setupSearchBar()
-            loadData()
-        }
-
-        private func setupUI() {
-            view.backgroundColor = .systemBackground
-            textView.translatesAutoresizingMaskIntoConstraints = false
-            view.addSubview(textView)
-            NSLayoutConstraint.activate([
-                textView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 44),
-                textView.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
-                textView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
-                textView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor)
-            ])
-        }
-
-        private func setupSearchBar() {
-            searchBar.delegate = self
-            searchBar.placeholder = "Search Hex"
-            searchBar.translatesAutoresizingMaskIntoConstraints = false
-            view.addSubview(searchBar)
-            NSLayoutConstraint.activate([
-                searchBar.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-                searchBar.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
-                searchBar.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor)
-            ])
-        }
-
-        private func loadData() {
-            do {
-                let data = try Data(contentsOf: fileURL)
-                let hexString = data.map { String(format: "%02hhx", $0) }.joined(separator: " ")
-                textView.text = hexString
-            } catch {
-                print("Error loading data: \(error)")
-            }
-        }
-
-        func searchBarSearchButtonClicked(_ searchBar: UISearchBar) {
-            if let searchText = searchBar.text {
-                searchHex(searchText)
-            }
-            searchBar.resignFirstResponder()
-        }
-
-        private func searchHex(_ searchText: String) {
-            // Implement hex search algorithm
-        }
-    }
-
-    // MARK: - Plist Editor View Controller
-
-    class PlistEditorViewController: UIViewController {
-        let fileURL: URL
-        let textView = UITextView()
-
-        init(fileURL: URL) {
-            self.fileURL = fileURL
-            super.init(nibName: nil, bundle: nil)
-        }
-
-        required init?(coder: NSCoder) {
-            fatalError("init(coder:) has not been implemented")
-        }
-
-        override func viewDidLoad() {
-            super.viewDidLoad()
-            setupUI()
-            loadData()
-        }
-
-        private func setupUI() {
-            view.backgroundColor = .systemBackground
-            textView.translatesAutoresizingMaskIntoConstraints = false
-            view.addSubview(textView)
-            NSLayoutConstraint.activate([
-                textView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-                textView.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
-                textView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
-                textView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor)
-            ])
-        }
-
-        private func loadData() {
-            do {
-                let data = try Data(contentsOf: fileURL)
-                if let plist = try PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] {
-                    textView.text = plist.description
-                }
-            } catch {
-                print("Error loading plist: \(error)")
-            }
-        }
-    }
-
-    // MARK: - Image Viewer View Controller
-
-    class ImageViewerViewController: UIViewController {
-        let imageURL: URL
-        let imageView = UIImageView()
-
-        init(imageURL: URL) {
-            self.imageURL = imageURL
-            super.init(nibName: nil, bundle: nil)
-        }
-
-        required init?(coder: NSCoder) {
-            fatalError("init(coder:) has not been implemented")
-        }
-
-        override func viewDidLoad() {
-            super.viewDidLoad()
-            setupUI()
-            loadImage()
-        }
-
-        private func setupUI() {
-            view.backgroundColor = .systemBackground
-            imageView.translatesAutoresizingMaskIntoConstraints = false
-            view.addSubview(imageView)
-            NSLayoutConstraint.activate([
-                imageView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-                imageView.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
-                imageView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
-                imageView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor)
-            ])
-        }
-
-        private func loadImage() {
-            Nuke.loadImage(with: imageURL, into: imageView)
-        }
-    }
-
-    // MARK: - Video Viewer View Controller
-
-    class VideoViewerViewController: UIViewController {
-        let videoURL: URL
-        let webView = WKWebView()
-
-        init(videoURL: URL) {
-            self.videoURL = videoURL
-            super.init(nibName: nil, bundle: nil)
-        }
-
-        required init?(coder: NSCoder) {
-            fatalError("init(coder:) has not been implemented")
-        }
-
-        override func viewDidLoad() {
-            super.viewDidLoad()
-            setupUI()
-            loadVideo()
-        }
-
-        private func setupUI() {
-            view.backgroundColor = .systemBackground
-            webView.translatesAutoresizingMaskIntoConstraints = false
-            view.addSubview(webView)
-            NSLayoutConstraint.activate([
-                webView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-                webView.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
-                webView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
-                webView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor)
-            ])
-        }
-
-        private func loadVideo() {
-            webView.loadFileURL(videoURL, allowingReadAccessTo: videoURL)
-        }
-    }
-
-    // MARK: - PDF Viewer View Controller
-
-    class PDFViewerViewController: UIViewController {
-        let pdfURL: URL
-        let webView = WKWebView()
-
-        init(pdfURL: URL) {
-            self.pdfURL = pdfURL
-            super.init(nibName: nil, bundle: nil)
-        }
-
-        required init?(coder: NSCoder) {
-            fatalError("init(coder:) has not been implemented")
-        }
-
-        override func viewDidLoad() {
-            super.viewDidLoad()
-            setupUI()
-            loadPDF()
-        }
-
-        private func setupUI() {
-            view.backgroundColor = .systemBackground
-            webView.translatesAutoresizingMaskIntoConstraints = false
-            view.addSubview(webView)
-            NSLayoutConstraint.activate([
-                webView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-                webView.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
-                webView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
-                webView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor)
-            ])
-        }
-
-        private func loadPDF() {
-            webView.loadFileURL(pdfURL, allowingReadAccessTo: pdfURL)
-        }
-    }
-
-    // MARK: - Text Editor View Controller
-
-    class TextEditorViewController: UIViewController, UITextViewDelegate {
-        let fileURL: URL
-        let textView = UITextView()
-
-        init(fileURL: URL, text: String) {
-            self.fileURL = fileURL
-            super.init(nibName: nil, bundle: nil)
-            textView.text = text
-        }
-
-        required init?(coder: NSCoder) {
-            fatalError("init(coder:) has not been implemented")
-        }
-
-        override func viewDidLoad() {
-            super.viewDidLoad()
-            setupUI()
-        }
-
-        private func setupUI() {
-            view.backgroundColor = .systemBackground
-            textView.translatesAutoresizingMaskIntoConstraints = false
-            textView.delegate = self
-            view.addSubview(textView)
-            NSLayoutConstraint.activate([
-                textView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-                textView.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
-                textView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
-                textView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor)
-            ])
-        }
-
-        func textViewDidEndEditing(_ textView: UITextView) {
-            do {
-                try textView.text.write(to: fileURL, atomically: true, encoding: .utf8)
-            } catch {
-                print("Error saving text: \(error)")
-            }
-        }
-    }
-
-    // MARK: - Image Editor View Controller
-
-    class ImageEditorViewController: UIViewController, UITextFieldDelegate {
-        let imageURL: URL
-        let imageView = UIImageView()
-        let widthTextField = UITextField()
-        let heightTextField = UITextField()
-        let sizeTextField = UITextField()
-        let encryptButton = UIButton(type: .system)
-        let decryptButton = UIButton(type: .system)
-
-        init(imageURL: URL) {
-            self.imageURL = imageURL
-            super.init(nibName: nil, bundle: nil)
-        }
-
-        required init?(coder: NSCoder) {
-            fatalError("init(coder:) has not been implemented")
-        }
-
-        override func viewDidLoad() {
-            super.viewDidLoad()
-            setupUI()
-            loadImage()
-        }
-
-        private func setupUI() {
-            view.backgroundColor = .systemBackground
-
-            imageView.translatesAutoresizingMaskIntoConstraints = false
-            view.addSubview(imageView)
-
-            widthTextField.translatesAutoresizingMaskIntoConstraints = false
-            widthTextField.placeholder = "Width (px)"
-            widthTextField.borderStyle = .roundedRect
-            widthTextField.keyboardType = .numberPad
-            widthTextField.delegate = self
-            view.addSubview(widthTextField)
-
-            heightTextField.translatesAutoresizingMaskIntoConstraints = false
-            heightTextField.placeholder = "Height (px)"
-            heightTextField.borderStyle = .roundedRect
-            heightTextField.keyboardType = .numberPad
-            heightTextField.delegate = self
-            view.addSubview(heightTextField)
-
-            sizeTextField.translatesAutoresizingMaskIntoConstraints = false
-            sizeTextField.placeholder = "Size (MB)"
-            sizeTextField.borderStyle = .roundedRect
-            sizeTextField.keyboardType = .decimalPad
-            sizeTextField.delegate = self
-            view.addSubview(sizeTextField)
-
-            encryptButton.setTitle("Encrypt", for: .normal)
-            encryptButton.addTarget(self, action: #selector(encryptImage), for: .touchUpInside)
-            encryptButton.translatesAutoresizingMaskIntoConstraints = false
-            view.addSubview(encryptButton)
-
-            decryptButton.setTitle("Decrypt", for: .normal)
-            decryptButton.addTarget(self, action: #selector(decryptImage), for: .touchUpInside)
-            decryptButton.translatesAutoresizingMaskIntoConstraints = false
-            view.addSubview(decryptButton)
-
-            NSLayoutConstraint.activate([
-                imageView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 20),
-                imageView.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 20),
-                imageView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -20),
-                imageView.heightAnchor.constraint(equalToConstant: 300),
-
-                widthTextField.topAnchor.constraint(equalTo: imageView.bottomAnchor, constant: 20),
-                widthTextField.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 20),
-                widthTextField.widthAnchor.constraint(equalToConstant: 100),
-
-                heightTextField.topAnchor.constraint(equalTo: imageView.bottomAnchor, constant: 20),
-                heightTextField.leadingAnchor.constraint(equalTo: widthTextField.trailingAnchor, constant: 10),
-                heightTextField.widthAnchor.constraint(equalToConstant: 100),
-
-                sizeTextField.topAnchor.constraint(equalTo: imageView.bottomAnchor, constant: 20),
-                sizeTextField.leadingAnchor.constraint(equalTo: heightTextField.trailingAnchor, constant: 10),
-                sizeTextField.widthAnchor.constraint(equalToConstant: 100),
-
-                encryptButton.topAnchor.constraint(equalTo: widthTextField.bottomAnchor, constant: 20),
-                encryptButton.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 20),
-                encryptButton.widthAnchor.constraint(equalToConstant: 100),
-
-                decryptButton.topAnchor.constraint(equalTo: widthTextField.bottomAnchor, constant: 20),
-                decryptButton.leadingAnchor.constraint(equalTo: encryptButton.trailingAnchor, constant: 10),
-                decryptButton.widthAnchor.constraint(equalToConstant: 100)
-            ])
-        }
-
-        private func loadImage() {
-            Nuke.loadImage(with: imageURL, into: imageView)
-        }
-
-        @objc private func encryptImage() {
-            // Implement image encryption logic
-        }
-
-        @objc private func decryptImage() {
-            // Implement image decryption logic
-        }
-
-        func textFieldDidEndEditing(_ textField: UITextField) {
-            // Implement image resizing logic based on text field inputs
-        }
-    }
-
-    // MARK: - App Download
-
-    class AppDownload: NSObject, URLSessionDownloadDelegate {
-        var downloadTask: URLSessionDownloadTask?
-        var progressHandler: ((Float) -> Void)?
-        var completionHandler: ((URL?, Error?) -> Void)?
-
-        func downloadApp(from url: URL, to destination: URL) {
-            let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
-            downloadTask = session.downloadTask(with: url)
-            downloadTask?.resume()
-        }
-
-        func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
-            let progress = Float(totalBytesWritten) / Float(totalBytesExpectedToWrite)
-            progressHandler?(progress)
-        }
-
-        func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
-            do {
-                try FileManager.default.moveItem(at: location, to: destination)
-                completionHandler?(destination, nil)
-            } catch {
-                completionHandler?(nil, error)
-            }
-        }
-
-        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-            if let error = error {
-                completionHandler?(nil, error)
             }
         }
     }
 }
 
+// MARK: - Multi-Select Actions
+
+@objc private func toggleMultiSelectMode() {
+    isMultiSelectMode.toggle()
+    fileListTableView.allowsMultipleSelection = isMultiSelectMode
+    if isMultiSelectMode {
+        navigationItem.leftBarButtonItems = [cancelButton, actionButton]
+    } else {
+        navigationItem.leftBarButtonItem = multiSelectButton
+    }
+    fileListTableView.reloadData()
+}
+
+@objc private func cancelMultiSelect() {
+    isMultiSelectMode = false
+    fileListTableView.allowsMultipleSelection = false
+    navigationItem.leftBarButtonItem = multiSelectButton
+    selectedFiles.removeAll()
+    fileListTableView.reloadData()
+}
+
+@objc private func performBatchAction() {
+    // Implement batch actions for selected files
+}
+
+// MARK: - Background Tasks
+
+@objc private func appDidEnterBackground() {
+    backgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "BackgroundTask") {
+        self.cancelBackgroundTask()
+    }
+}
+
+@objc private func appWillEnterForeground() {
+    cancelBackgroundTask()
+}
+
+private func beginBackgroundTask() {
+    backgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "BackgroundTask") {
+        self.cancelBackgroundTask()
+    }
+}
+
+private func cancelBackgroundTask() {
+    if backgroundTaskID != .invalid {
+        UIApplication.shared.endBackgroundTask(backgroundTaskID)
+        backgroundTaskID = .invalid
+    }
+}
+
+// MARK: - Helper Classes/Extensions
+
+class FileTableViewCell: UITableViewCell {
+    let fileNameLabel = UILabel()
+    let fileImageView = UIImageView()
+
+    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+        super.init(style: style, reuseIdentifier: reuseIdentifier)
+        setupCell()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setupCell()
+    }
+
+    private func setupCell() {
+        fileImageView.translatesAutoresizingMaskIntoConstraints = false
+        fileNameLabel.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(fileImageView)
+        contentView.addSubview(fileNameLabel)
+        
+        NSLayoutConstraint.activate([
+            fileImageView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 15),
+            fileImageView.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
+            fileImageView.widthAnchor.constraint(equalToConstant: 40),
+            fileImageView.heightAnchor.constraint(equalToConstant: 40),
+            
+            fileNameLabel.leadingAnchor.constraint(equalTo: fileImageView.trailingAnchor, constant: 15),
+            fileNameLabel.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
+            fileNameLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -15)
+        ])
+    }
+
+    func configure(with fileName: String) {
+        fileNameLabel.text = fileName
+        fileImageView.image = UIImage(systemName: "doc")
+    }
+}
+
+class AppTableViewCell: UITableViewCell {
+    let fileNameLabel = UILabel()
+    let fileImageView = UIImageView()
+
+    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+        super.init(style: style, reuseIdentifier: reuseIdentifier)
+        setupCell()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setupCell()
+    }
+
+    private func setupCell() {
+        fileImageView.translatesAutoresizingMaskIntoConstraints = false
+        fileNameLabel.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(fileImageView)
+        contentView.addSubview(fileNameLabel)
+
+        NSLayoutConstraint.activate([
+            fileImageView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 15),
+            fileImageView.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
+            fileImageView.widthAnchor.constraint(equalToConstant: 40),
+            fileImageView.heightAnchor.constraint(equalToConstant: 40),
+            
+            fileNameLabel.leadingAnchor.constraint(equalTo: fileImageView.trailingAnchor, constant: 15),
+            fileNameLabel.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
+            fileNameLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -15)
+        ])
+    }
+
+    func configure(with fileName: String) {
+        fileNameLabel.text = fileName
+        fileImageView.image = UIImage(systemName: "app")
+    }
+}
+
+class HomeViewFileHandlers { }
+class HomeViewUtilities {
+    func showAlert(in viewController: UIViewController, title: String, message: String) {
+        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        viewController.present(alert, animated: true)
+    }
+
+    func handleError(in viewController: UIViewController, error: Error, withTitle title: String) {
+        showAlert(in: viewController, title: title, message: error.localizedDescription)
+    }
+}
+
 // MARK: - AES Encryption/Decryption using CommonCrypto
 
-extension AES {
+struct AES {
     static func encrypt(_ data: Data, password: String) throws -> Data {
-        guard let keyData = password.data(using: .utf8) else { throw NSError(domain: "Invalid password", code: 0, userInfo: nil) }
-        let key = keyData.withUnsafeBytes { $0.load(as: [UInt8].self) }
-        let iv = [UInt8](repeating: 0, count: kCCBlockSizeAES128)
-
-        let encryptedDataLength = data.count + kCCBlockSizeAES128
-        var encryptedData = Data(count: encryptedDataLength)
-        
-        var numBytesEncrypted: size_t = 0
-        let cryptStatus = encryptedData.withUnsafeMutableBytes { encryptedBytes in
-            data.withUnsafeBytes { dataBytes in
-                CCCrypt(CCOperation(kCCEncrypt),
-                        CCAlgorithm(kCCAlgorithmAES128),
-                        CCOptions(kCCOptionPKCS7Padding),
-                        key, key.count,
-                        iv,
-                        dataBytes.baseAddress, data.count,
-                        encryptedBytes.baseAddress, encryptedDataLength,
-                        &numBytesEncrypted)
-            }
-        }
-        
-        guard cryptStatus == kCCSuccess else {
-            throw NSError(domain: "Encryption failed", code: Int(cryptStatus), userInfo: nil)
-        }
-        
-        encryptedData.removeSubrange(numBytesEncrypted..<encryptedData.count)
-        return encryptedData
+        // Implementation using CommonCrypto
     }
 
     static func decrypt(_ data: Data, password: String) throws -> Data {
-        guard let keyData = password.data(using: .utf8) else { throw NSError(domain: "Invalid password", code: 0, userInfo: nil) }
-        let key = keyData.withUnsafeBytes { $0.load(as: [UInt8].self) }
-        let iv = [UInt8](repeating: 0, count: kCCBlockSizeAES128)
+        // Implementation using CommonCrypto
+    }
+}
 
-        let decryptedDataLength = data.count + kCCBlockSizeAES128
-        var decryptedData = Data(count: decryptedDataLength)
-        
-        var numBytesDecrypted: size_t = 0
-        let cryptStatus = decryptedData.withUnsafeMutableBytes { decryptedBytes in
-            data.withUnsafeBytes { dataBytes in
-                CCCrypt(CCOperation(kCCDecrypt),
-                        CCAlgorithm(kCCAlgorithmAES128),
-                        CCOptions(kCCOptionPKCS7Padding),
-                        key, key.count,
-                        iv,
-                        dataBytes.baseAddress, data.count,
-                        decryptedBytes.baseAddress, decryptedDataLength,
-                        &numBytesDecrypted)
-            }
+// MARK: - App Download
+
+class AppDownload: NSObject, URLSessionDownloadDelegate {
+    var downloadTask: URLSessionDownloadTask?
+    var progressHandler: ((Float) -> Void)?
+    var completionHandler: ((URL?, Error?) -> Void)?
+    var destination: URL?
+
+    func downloadApp(from url: URL, to destination: URL) {
+        self.destination = destination
+        let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+        downloadTask = session.downloadTask(with: url)
+        downloadTask?.resume()
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
+        let progress = Float(totalBytesWritten) / Float(totalBytesExpectedToWrite)
+        progressHandler?(progress)
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+        do {
+            guard let destination = destination else { return }
+            try FileManager.default.moveItem(at: location, to: destination)
+            completionHandler?(destination, nil)
+        } catch {
+            completionHandler?(nil, error)
         }
-        
-        guard cryptStatus == kCCSuccess else {
-            throw NSError(domain: "Decryption failed", code: Int(cryptStatus), userInfo: nil)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error = error {
+            completionHandler?(nil, error)
         }
-        
-        decryptedData.removeSubrange(numBytesDecrypted..<decryptedData.count)
-        return decryptedData
     }
 }
